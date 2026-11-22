@@ -18,7 +18,7 @@ The last command prints the path of the assembled plugin. Copy that directory to
 
 ## Development
 
-Use the default branch `v` for this fork. It starts from upstream [1e829bf](https://github.com/giancarloerra/SocratiCode/commit/1e829bf7ddf1e34c4cc6713227f00422cee791cc). Submit contributions to the original project separately from its current `main`.
+Use the default branch `main` for this fork. It starts from upstream [1e829bf](https://github.com/giancarloerra/SocratiCode/commit/1e829bf7ddf1e34c4cc6713227f00422cee791cc). Submit contributions to the original project separately from its current `main`.
 
 ```sh
 npm run lint

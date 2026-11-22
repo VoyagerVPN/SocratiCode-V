@@ -21,8 +21,8 @@
           "Read"
         ],
         "websiteURL": "https://github.com/VoyagerVPN/SocratiCode-V",
-        "privacyPolicyURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/v/SECURITY.md",
-        "termsOfServiceURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/v/LICENSE",
+        "privacyPolicyURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/main/SECURITY.md",
+        "termsOfServiceURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/main/LICENSE",
         "defaultPrompt": [
           "Use SocratiCode to search the codebase for authentication handling.",
           "Use SocratiCode to visualize the dependency graph of this project."
