@@ -1,0 +1,13 @@
+.git/
+node_modules/
+dist/
+build/
+.cache/
+.tgrep/
+coverage/
+tests/fixtures/
+*.log
+*.tsbuildinfo
+
+# Аналоги индексируются отдельно как источники проекта.
+.research/

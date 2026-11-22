@@ -19,6 +19,7 @@ export function detectGitBranch(projectPath: string): string | null {
       cwd: path.resolve(projectPath),
       encoding: "utf-8",
       timeout: 5000,
+      windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
     // "HEAD" is returned for detached HEAD state — treat as no branch

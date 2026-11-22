@@ -11,6 +11,7 @@
  * surface log notifications.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { appendFileSync } from "node:fs";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -81,6 +82,12 @@ function toMcpLevel(level: LogLevel): McpLogLevel {
 // ---------------------------------------------------------------------------
 type LogSenderFn = (params: { level: McpLogLevel; logger: string; data: string }) => void;
 let _mcpLogSender: LogSenderFn | null = null;
+const requestLogSender = new AsyncLocalStorage<LogSenderFn>();
+
+/** Логи параллельных MCP-запросов привязаны к своему контексту, а не последнему клиенту. */
+export function runWithMcpLogSender<T>(sender: LogSenderFn, operation: () => Promise<T>): Promise<T> {
+  return requestLogSender.run(sender, operation);
+}
 
 /**
  * Register a function that forwards log entries as MCP notifications/message.
@@ -90,10 +97,10 @@ export function setMcpLogSender(fn: LogSenderFn): void {
   _mcpLogSender = fn;
 }
 
-function sendMcpLog(level: LogLevel, message: string): void {
-  if (_mcpLogSender) {
+function sendMcpLog(level: LogLevel, message: string, sender: LogSenderFn): void {
+  if (sender) {
     try {
-      _mcpLogSender({ level: toMcpLevel(level), logger: "socraticode", data: message });
+      sender({ level: toMcpLevel(level), logger: "socraticode", data: message });
     } catch {
       // Transport not yet connected or already closed — silently ignore.
     }
@@ -112,7 +119,8 @@ function emit(level: LogLevel, message: string, context?: Record<string, unknown
     }
   }
 
-  if (_mcpLogSender) {
+  const sender = requestLogSender.getStore() ?? _mcpLogSender;
+  if (sender) {
     // MCP transport is active: route via notifications/message only.
     // Writing to stderr while hosted inside Cline causes Cline to emit
     // "LOG Server "name" info:" with the content silently dropped (Cline's
@@ -121,7 +129,7 @@ function emit(level: LogLevel, message: string, context?: Record<string, unknown
     const fullMessage = context && Object.keys(context).length > 0
       ? `${message} ${JSON.stringify(context)}`
       : message;
-    sendMcpLog(level, fullMessage);
+    sendMcpLog(level, fullMessage, sender);
   } else {
     // No MCP transport yet (startup, tests, direct invocation): write JSON to stderr.
     process.stderr.write(`${formatLog(level, message, context)}\n`);

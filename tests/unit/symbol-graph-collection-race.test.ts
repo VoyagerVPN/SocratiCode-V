@@ -127,4 +127,19 @@ describe("symbol-graph collection concurrency", () => {
     expect(mockGetCollections).toHaveBeenCalledTimes(3);
     expect(mockCreateCollection).not.toHaveBeenCalled();
   });
+
+  it("creates each payload-only graph collection with one target segment", async () => {
+    await ensureSymbolGraphCollections("project");
+
+    for (const name of [
+      symgraphMetaCollectionName("project"),
+      symgraphFileCollectionName("project"),
+      symgraphIndexCollectionName("project"),
+    ]) {
+      expect(mockCreateCollection).toHaveBeenCalledWith(
+        name,
+        expect.objectContaining({ optimizers_config: { default_segment_number: 1 } }),
+      );
+    }
+  });
 });

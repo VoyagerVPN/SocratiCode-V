@@ -3,6 +3,7 @@
 
 /** Unit tests for context-tool routing and result formatting. */
 
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ────────────────────────────────────────────────────────────────
@@ -67,16 +68,24 @@ vi.mock("../../src/services/context-artifacts.js", () => ({
 
 // ── Imports (after mocks) ────────────────────────────────────────────────
 
+import { ensureQdrantReady } from "../../src/services/docker.js";
+import { loadContextMetadata } from "../../src/services/qdrant.js";
 import { handleContextTool } from "../../src/tools/context-tools.js";
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-const TEST_PATH = "/tmp/test-project";
+const TEST_PATH = path.resolve(".cache/test-tmp/context-tool-project");
 
 describe("context indexing and search ownership", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetCollectionInfo.mockResolvedValue(null);
+  });
+
+  it("resumes infrastructure before listing configured artifacts from a sleeping store", async () => {
+    vi.mocked(ensureQdrantReady).mockRejectedValueOnce(new Error("Sleeping Qdrant could not resume"));
+    await expect(handleContextTool("codebase_context", { projectPath: TEST_PATH })).rejects.toThrow("Sleeping Qdrant could not resume");
+    expect(loadContextMetadata).not.toHaveBeenCalled();
   });
 
   it("delegates explicit indexing to the context artifact service", async () => {

@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "^(startup|resume|clear)$",
+      "hooks": [{
+        "type": "command",
+        "command": "node \"${PLUGIN_ROOT}/hooks/session-start.mjs\"",
+        "timeout": 40
+      }]
+    }]
+  }
+}

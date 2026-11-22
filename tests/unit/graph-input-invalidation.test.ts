@@ -654,6 +654,30 @@ describe("graph input invalidation", () => {
       expect(finish(recorder).files["src/a.ts"]).toBe(hashContent("export const a = 1;\n"));
     });
 
+    it("records native bindings as hashes without persisting their absolute targets", () => {
+      const recorder = recorderFor();
+      recorder.realpath?.("/project/node_modules/db", "/project/packages/db");
+      recorder.realpath?.("/project/node_modules/db", "/project/packages/db");
+      recorder.realpath?.("/project/apps/crm/node_modules", null);
+      const record = finish(recorder);
+      expect(record.realpaths).toEqual({
+        "apps/crm/node_modules": null,
+        "node_modules/db": hashContent("/project/packages/db"),
+      });
+      expect(JSON.stringify(record)).not.toContain("/project/packages/db");
+    });
+
+    it.each([
+      [null, "/project/packages/db"],
+      ["/project/packages/db", "/project/node_modules/.installed/db"],
+      ["/project/packages/db", null],
+    ])("rejects a binding observed with contradictory targets %s and %s", (before, after) => {
+      const recorder = recorderFor();
+      recorder.realpath?.("/project/node_modules/db", before);
+      recorder.realpath?.("/project/node_modules/db", after);
+      expect(() => finish(recorder)).toThrow(GraphInputsMovedDuringBuild);
+    });
+
     it("refuses to seal a record for a file read twice with different content", () => {
       const recorder = recorderFor();
       recorder.read("/project/src/a.ts", "export const a = 1;\n");
@@ -768,6 +792,18 @@ describe("graph input invalidation", () => {
       });
     });
 
+    it("refreshes a pre-RPC Unreal module graph once on a quiet update", async () => {
+      const project = createFixtureProject("unreal-rpc-upgrade");
+      try {
+        addFileToFixture(project.root, "Source/Game/Game.Build.cs", "class Game {}");
+        const { graphInputs } = await buildCodeGraph(project.root);
+        const caps = await currentGraphCapabilities();
+        const decideForGame = (stored: unknown) => decideGraphRebuild(project.root, stored, quiet(), EXTRA_EXTENSIONS, caps);
+        await expect(decideForGame({ ...graphInputs, unrealRpcVersion: undefined })).resolves.toMatchObject({ rebuild: true });
+        await expect(decideForGame(graphInputs)).resolves.toMatchObject({ rebuild: false });
+      } finally { project.cleanup(); }
+    });
+
     it("rebuilds once for a record written under another shape version", async () => {
       const legacy = { ...record, version: GRAPH_INPUTS_VERSION + 1 };
       await expect(decide(legacy)).resolves.toMatchObject({ rebuild: true });
@@ -800,6 +836,18 @@ describe("graph input invalidation", () => {
       // Stored as JSON beside the graph, so the string is the shape that
       // actually comes back from Qdrant — and it must decide the same way.
       await expect(decide(JSON.stringify(record))).resolves.toMatchObject({ rebuild: false });
+    });
+
+    it("accepts records without bindings and roundtrips an optional binding record", async () => {
+      expect(record.realpaths).toBeUndefined();
+      await expect(decide(JSON.stringify(record))).resolves.toMatchObject({ rebuild: false });
+      const withBinding = { ...record, realpaths: { ".": hashContent(fs.realpathSync.native(fixture.root).split(path.sep).join("/")) } };
+      await expect(decide(JSON.stringify(withBinding))).resolves.toMatchObject({ rebuild: false });
+      await expect(decide({ ...record, realpaths: { ".": null } })).resolves.toMatchObject({ rebuild: true });
+    });
+
+    it.each([null, [], 7, { "node_modules/db": 7 }])("rejects a malformed optional binding record %j", async (realpaths) => {
+      await expect(decide({ ...record, realpaths })).resolves.toMatchObject({ rebuild: true });
     });
   });
 });

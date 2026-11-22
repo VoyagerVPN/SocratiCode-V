@@ -15,6 +15,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
 
+vi.mock("../../src/services/docker.js", () => ({
+  ensureQdrantReady: vi.fn(async () => ({ started: false, pulled: false })),
+}));
+
 /** Points whose payload.relativePath is in here are rejected by the stub client. */
 const failUpsertFor = new Set<string>();
 

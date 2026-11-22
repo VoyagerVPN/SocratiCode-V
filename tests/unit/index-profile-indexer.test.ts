@@ -7,6 +7,9 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_INDEX_FORMAT_VERSION, type EffectiveIndexProfile } from "../../src/services/index-profile.js";
 
+const { infrastructureReady } = vi.hoisted(() => ({ infrastructureReady: vi.fn() }));
+vi.mock("../../src/services/docker.js", () => ({ ensureQdrantReady: infrastructureReady }));
+
 let collectionInfo: { pointsCount: number; status: string } | null = null;
 let storedHashes: Map<string, string> | null = null;
 let storedProfile: EffectiveIndexProfile | null = null;
@@ -192,6 +195,7 @@ async function createProject(relativePath: string, content: string): Promise<str
 }
 
 beforeEach(async () => {
+  infrastructureReady.mockReset().mockResolvedValue({ started: false, pulled: false });
   collectionInfo = null;
   storedHashes = null;
   storedProfile = null;
@@ -211,10 +215,18 @@ afterEach(async () => {
 });
 
 describe("code-index effective profile compatibility", () => {
+  it.each(["indexProject", "updateProjectIndex"] as const)("%s checks infrastructure before reading or mutating a sleeping store", async (method) => {
+    const indexer = await loadIndexer();
+    const project = await createProject("app.ts", "export const value = 1;\n");
+    infrastructureReady.mockRejectedValueOnce(new Error("Sleeping Qdrant could not resume"));
+    await expect(indexer[method](project)).rejects.toThrow("Sleeping Qdrant could not resume");
+    expect(savedMetadata).toHaveLength(0);
+    expect(upsertedBatches).toHaveLength(0);
+  });
   it.each([
     ["indexProject", true], ["indexProject", false],
     ["updateProjectIndex", true], ["updateProjectIndex", false],
-  ] as const)("%s requests completed replacements and removals only for Git targets (%s)", async (method, gitTarget) => {
+  ] as const)("%s waits for replacement cleanup and preserves the Git removal policy (%s)", async (method, gitTarget) => {
     const indexer = await loadIndexer();
     const { legacyIndexProfile } = await import("../../src/services/index-profile.js");
     const { projectIdFromPath } = await import("../../src/config.js");
@@ -227,7 +239,7 @@ describe("code-index effective profile compatibility", () => {
 
     await indexer[method](project, undefined, undefined, gitTarget ? target : undefined);
 
-    expect(deleteFileChunks).toHaveBeenCalledWith(`codebase_${target.projectId}`, "notes.txt", gitTarget);
+    expect(deleteFileChunks).toHaveBeenCalledWith(`codebase_${target.projectId}`, "notes.txt", true, ["04b24b3a-8789-69c1-4ca1-56e67702f334"]);
     expect(deleteFileChunks).toHaveBeenCalledWith(`codebase_${target.projectId}`, "removed.txt", gitTarget);
   });
 
@@ -307,7 +319,8 @@ describe("code-index effective profile compatibility", () => {
     const result = await indexer.updateProjectIndex(project);
 
     expect(result).toMatchObject({ added: 3, updated: 0, removed: 0 });
-    expect(deletedFiles).toEqual([]);
+    // Очистка новых файлов убирает остатки незавершённой записи, но не затрагивает неизменённый файл.
+    expect(deletedFiles).not.toContain("notes.txt");
     const finalHashes = savedMetadata.at(-1)?.hashes;
     expect(finalHashes?.size).toBe(4);
     expect([...(finalHashes?.keys() ?? [])].sort()).toEqual([

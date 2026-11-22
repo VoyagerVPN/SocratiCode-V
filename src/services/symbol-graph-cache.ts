@@ -25,8 +25,8 @@ import {
   allNameShardKeys,
   LEGACY_SYMBOL_GRAPH_GENERATION,
   loadFilePayload,
-  loadNameShard,
-  loadReverseShard,
+  loadNameShards,
+  loadReverseShards,
   loadSymbolGraphMeta,
   releaseReader,
   resetGenerationLifecycleState,
@@ -170,12 +170,8 @@ export class SymbolGraphCache {
       if (this.nameIndex) return this.nameIndex;
       const merged = new Map<string, SymbolRef[]>();
       const shardKeys = allNameShardKeys();
-      const shards = await Promise.all(
-        shardKeys.map((k) => loadNameShard(
-          this.projectId,
-          k,
-          this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION,
-        )),
+      const shards = await loadNameShards(
+        this.projectId, shardKeys, this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION,
       );
       for (const shard of shards) {
         if (!shard) continue;
@@ -206,12 +202,8 @@ export class SymbolGraphCache {
       const merged = new Map<string, Set<string>>();
       const buckets: number[] = [];
       for (let i = 0; i < SYMBOL_REVERSE_SHARDS; i++) buckets.push(i);
-      const shards = await Promise.all(
-        buckets.map((b) => loadReverseShard(
-          this.projectId,
-          b,
-          this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION,
-        )),
+      const shards = await loadReverseShards(
+        this.projectId, buckets, this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION,
       );
       for (const shard of shards) {
         if (!shard) continue;

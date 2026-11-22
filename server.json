@@ -6,12 +6,12 @@
     "url": "https://github.com/giancarloerra/socraticode",
     "source": "github"
   },
-  "version": "1.16.0",
+  "version": "1.16.1-local.9",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "socraticode",
-      "version": "1.16.0",
+      "version": "1.16.1-local.9",
       "transport": {
         "type": "stdio"
       },

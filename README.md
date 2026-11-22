@@ -1,3 +1,40 @@
+# SocratiCode V
+
+SocratiCode V is VoyagerVPN’s fork of [SocratiCode](https://github.com/giancarloerra/SocratiCode), a local code search and navigation engine by Giancarlo Erra and Altaire Limited.
+
+Several Codex sessions can use one local MCP server. The portable profile pairs Jina v5 Nano Retrieval embeddings with Ollama on an NVIDIA GPU and stores indexes in Qdrant. Compact search results share overlapping source lines and support pagination. C++ graphs can follow Unreal RPCs, delegate bindings, task launches and reads from shared queues.
+
+## Run the Codex plugin
+
+The portable profile targets Windows, Docker Desktop with Linux containers, and an NVIDIA GPU available to Docker. For building and testing, use Node.js 22.22.2 or newer in the 22.x series.
+
+```sh
+npm ci
+npm run build
+node scripts/package-local-plugin.mjs --stage-only
+```
+
+The last command prints the path of the assembled plugin. Copy that directory to a permanent location and follow the [installation guide](plugins/socraticode/README-SETUP.md). The MCP endpoint is `http://127.0.0.1:16335/mcp`. The internal package and tool prefix remain `socraticode`.
+
+## Development
+
+Use the default branch `v` for this fork. It starts from upstream [1e829bf](https://github.com/giancarloerra/SocratiCode/commit/1e829bf7ddf1e34c4cc6713227f00422cee791cc). Submit contributions to the original project separately from its current `main`.
+
+```sh
+npm run lint
+npm run build
+npm run test:unit
+```
+
+See the [developer guide](DEVELOPER.md) for graph semantics and the [idle lifecycle](IDLE_LIFECYCLE.md) for shared service behaviour. The original project maintains its [own releases and integrations](https://github.com/giancarloerra/SocratiCode).
+
+## License
+
+See [AGPL-3.0](LICENSE) and the [third-party notices](THIRD-PARTY-LICENSES). Original copyright notices are retained.
+
+<details>
+<summary>Original SocratiCode guide and installers for the upstream distribution</summary>
+
 <p align="center">
   <img src="./socraticode_logo_thumbnail.png" alt="SocratiCode logo" />
 </p>
@@ -1913,3 +1950,5 @@ SocratiCode includes open-source dependencies under their own licenses
 
 Contributions are welcome. By submitting a pull request, you agree to the
 [Contributor License Agreement](CLA.md).
+
+</details>

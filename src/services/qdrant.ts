@@ -8,6 +8,7 @@ import { QDRANT_API_KEY, QDRANT_COLLECTION_PREFIX, QDRANT_HOST, QDRANT_PORT, QDR
 import type { ArtifactIndexState, CodeGraph, FileChunk, SearchResult } from "../types.js";
 import { getEmbeddingConfig } from "./embedding-config.js";
 import { generateEmbeddings, generateQueryEmbedding, prepareDocumentText } from "./embeddings.js";
+import { computeImportCoverage, readImportCoverage } from "./graph-analysis.js";
 import type { GraphInputRecord } from "./graph-inputs.js";
 import {
   documentTextProfile,
@@ -59,20 +60,31 @@ async function withRetry<T>(
  * the one part a user can act on, so every symbol-graph failure looked
  * identical. Appends that reason when present, and looks through a `cause`
  * chain so an error already wrapped by {@link wrapQdrantError} still resolves.
+ *
+ * Without a server reason, appends the innermost cause's message and `code`
+ * instead, so a transport failure reads as
+ * `fetch failed: other side closed [UND_ERR_SOCKET]` rather than `fetch failed`.
  */
 export function describeQdrantError(err: unknown): string {
   const base = err instanceof Error ? err.message : String(err);
   // Walk the cause chain (bounded — these are never deep) looking for the
   // client's `data` envelope, which may sit on the error or on its cause.
   let current: unknown = err;
+  let innermost: unknown;
   for (let depth = 0; depth < 5 && current; depth++) {
     const reason = (current as { data?: { status?: { error?: unknown } } })?.data?.status?.error;
     if (typeof reason === "string" && reason.length > 0) {
       return base.includes(reason) ? base : `${base}: ${reason}`;
     }
+    if (current !== err) innermost = current;
     current = (current as { cause?: unknown })?.cause;
   }
-  return base;
+  if (!(innermost instanceof Error)) return base;
+  const { message } = innermost;
+  const code = (innermost as { code?: unknown }).code;
+  const tag = typeof code === "string" ? code : "";
+  const detail = message && tag ? `${message} [${tag}]` : message || tag;
+  return base.includes(detail) ? base : `${base}: ${detail}`;
 }
 
 /**
@@ -802,11 +814,10 @@ const MAX_BM25_TEXT_CHARS = 32_000; // ~32KB
  * point still fails, this throws: a partial write must fail the whole indexing
  * operation.
  *
- * Callers must not treat a partial write as success. A re-indexed file has its
- * previous chunks deleted before this call, so recording it as indexed after a
- * partial failure strands it at zero chunks with a content hash that suppresses
- * every future re-index. Throwing leaves stored hashes and earlier checkpoints
- * untouched, so the next index or update retries the file naturally. */
+ * Частичная запись не считается успехом: вызывающий код не обновляет хеши
+ * и не удаляет прежние фрагменты, пока весь пакет не записан. Ошибка оставляет
+ * прежний checkpoint, поэтому следующее обновление повторит незавершённые файлы.
+ * waitForCompletion позволяет дождаться применения новых точек до очистки старых. */
 export async function upsertPreEmbeddedChunks(
   collectionName: string,
   points: Array<{
@@ -815,6 +826,7 @@ export async function upsertPreEmbeddedChunks(
     bm25Text: string;
     payload: Record<string, unknown>;
   }>,
+  waitForCompletion = false,
 ): Promise<void> {
   if (points.length === 0) return;
 
@@ -842,7 +854,7 @@ export async function upsertPreEmbeddedChunks(
     const batchLabel = `Qdrant upsert batch ${Math.floor(i / 100) + 1}`;
     try {
       await withRetry(
-        () => qdrant.upsert(collectionName, { points: batch }),
+        () => qdrant.upsert(collectionName, { points: batch, ...(waitForCompletion ? { wait: true } : {}) }),
         batchLabel,
       );
     } catch (batchErr) {
@@ -854,7 +866,7 @@ export async function upsertPreEmbeddedChunks(
       let skipped = 0;
       for (const point of batch) {
         try {
-          await qdrant.upsert(collectionName, { points: [point] });
+          await qdrant.upsert(collectionName, { points: [point], ...(waitForCompletion ? { wait: true } : {}) });
         } catch (pointErr) {
           skipped++;
           const filePath = point.payload?.relativePath ?? point.payload?.filePath ?? point.id;
@@ -890,10 +902,42 @@ export async function upsertPreEmbeddedChunks(
   }
 }
 
-/** Delete a file's chunks, optionally waiting for application before reporting freshness. */
-export async function deleteFileChunks(collectionName: string, relativePath: string, waitForCompletion = false): Promise<void> {
+/** Удаляет фрагменты файла, сохраняя уже записанные новые точки из retainedChunkIds. */
+export async function deleteFileChunks(
+  collectionName: string,
+  relativePath: string,
+  waitForCompletion = false,
+  retainedChunkIds: readonly string[] = [],
+): Promise<void> {
   const qdrant = getClient();
   logger.info("Deleting file chunks", { collection: collectionName, relativePath });
+  if (retainedChunkIds.length > 0) {
+    // В Qdrant 1.17 фильтр must_not(has_id: UUID) оставляет WAL, который не читается после перезапуска.
+    const retained = new Set(retainedChunkIds);
+    const obsolete: Array<string | number> = [];
+    let offset: string | number | undefined;
+    do {
+      const page = await withRetry(() => qdrant.scroll(collectionName, {
+        filter: { must: [{ key: "relativePath", match: { value: relativePath } }] },
+        limit: 256, with_payload: false, with_vector: false,
+        ...(offset === undefined ? {} : { offset }),
+      }), "Qdrant list file chunks");
+      for (const point of page.points) {
+        if (typeof point.id !== "string" || !retained.has(point.id)) obsolete.push(point.id);
+      }
+      const next = page.next_page_offset;
+      if (next != null && typeof next !== "string" && typeof next !== "number") {
+        throw new Error("Unsupported Qdrant file-chunk scroll cursor");
+      }
+      if (next != null && next === offset) throw new Error("Qdrant file-chunk scroll cursor did not advance");
+      offset = next ?? undefined;
+    } while (offset !== undefined);
+    for (let start = 0; start < obsolete.length; start += 256) {
+      const batch = obsolete.slice(start, start + 256);
+      await withRetry(() => qdrant.delete(collectionName, { points: batch, wait: true }), "Qdrant delete obsolete chunks");
+    }
+    return;
+  }
   await withRetry(
     () => qdrant.delete(collectionName, {
       ...(waitForCompletion ? { wait: true } : {}),
@@ -976,9 +1020,11 @@ async function searchChunksWithVector(
 ): Promise<SearchResult[]> {
   const qdrant = getClient();
 
-  const filter: { must: Array<{ key: string; match: { value: string } }> } = { must: [] };
+  const filter: { must: Array<{ key: string; match: { value: string } | { any: string[] } }> } = { must: [] };
   if (fileFilter) {
-    filter.must.push({ key: "relativePath", match: { value: fileFilter } });
+    // Граф возвращает /, а Windows-индексы хранят \: оба написания задают один файл.
+    const paths = [...new Set([fileFilter.replaceAll("\\", "/"), fileFilter.replaceAll("/", "\\")])];
+    filter.must.push({ key: "relativePath", match: paths.length === 1 ? { value: paths[0] } : { any: paths } });
   }
   if (languageFilter) {
     filter.must.push({ key: "language", match: { value: languageFilter } });
@@ -1009,7 +1055,7 @@ async function searchChunksWithVector(
   const results = await withRetry(
     () => qdrant.query(collectionName, queryPayload),
     "Qdrant hybrid search",
-  );
+  ).catch((error: unknown) => { throw wrapQdrantError("searchChunks", { collection: collectionName }, error); });
 
   return results.points.map((r) => {
     const result: SearchResult = {
@@ -1163,17 +1209,28 @@ export function mergeMultiCollectionResults(
  * @param fileFilter - Optional relativePath filter applied to every collection.
  * @param languageFilter - Optional language filter applied to every collection.
  */
+export interface MultiCollectionSearchResult {
+  results: SearchResult[];
+  searchedSources: string[];
+  failedSources: Array<{ path: string; error: string }>;
+}
+
 export async function searchMultipleCollections(
   collections: Array<{ name: string; label: string }>,
   query: string,
   limit: number = 10,
   fileFilter?: string,
   languageFilter?: string,
-): Promise<SearchResult[]> {
-  if (collections.length === 0) return [];
+): Promise<MultiCollectionSearchResult> {
+  if (collections.length === 0) return { results: [], searchedSources: [], failedSources: [] };
   if (collections.length === 1) {
-    const results = await searchChunks(collections[0].name, query, limit, fileFilter, languageFilter);
-    return results.map((r) => ({ ...r, project: collections[0].label }));
+    const { name, label } = collections[0];
+    try {
+      const results = await searchChunks(name, query, limit, fileFilter, languageFilter);
+      return { results: results.map((r) => ({ ...r, project: label })), searchedSources: [label], failedSources: [] };
+    } catch (error) {
+      return { results: [], searchedSources: [], failedSources: [{ path: label, error: error instanceof Error ? error.message : String(error) }] };
+    }
   }
 
   // Reuse a query vector only where the persisted query-side identity is
@@ -1187,7 +1244,7 @@ export async function searchMultipleCollections(
   const collectionResults: Array<{ label: string; results: SearchResult[] }> = [];
 
   const allResults = await Promise.all(
-    collections.map(async ({ name, label }) => {
+    collections.map(async ({ name, label }): Promise<{ label: string; results: SearchResult[]; error?: string }> => {
       try {
         const profile = await loadEffectiveIndexProfileForCollection(name);
         const key = queryProfileKey(profile, name);
@@ -1208,14 +1265,17 @@ export async function searchMultipleCollections(
           collection: name,
           error: err instanceof Error ? err.message : String(err),
         });
-        return { label, results: [] as SearchResult[] };
+        return { label, results: [], error: err instanceof Error ? err.message : String(err) };
       }
     }),
   );
 
   collectionResults.push(...allResults);
 
-  return mergeMultiCollectionResults(collectionResults, limit);
+  return { results: mergeMultiCollectionResults(collectionResults, limit),
+    searchedSources: allResults.filter((result) => result.error === undefined).map((result) => result.label),
+    failedSources: allResults.flatMap((result) => result.error === undefined ? [] : [{ path: result.label, error: result.error }]),
+  };
 }
 
 /** Hybrid search with arbitrary payload filters.
@@ -1523,6 +1583,7 @@ export interface ProjectMetadata {
   filesIndexed: number;
   indexingStatus: IndexingStatus;
   effectiveProfile: EffectiveIndexProfile | null;
+  scanFailure?: string;
 }
 
 function profileFromPayload(
@@ -1544,6 +1605,7 @@ export async function saveProjectMetadata(
   fileHashes: Map<string, string>,
   indexingStatus: IndexingStatus,
   effectiveProfile: EffectiveIndexProfile,
+  scanFailure?: string,
 ): Promise<void> {
   await ensureMetadataCollection();
   const qdrant = getClient();
@@ -1568,6 +1630,7 @@ export async function saveProjectMetadata(
           filesIndexed,
           fileHashes: JSON.stringify(hashObj),
           indexingStatus,
+          scanFailure: scanFailure ?? null,
           effectiveIndexProfile: JSON.stringify(effectiveProfile),
           ...ownership,
         },
@@ -1633,6 +1696,7 @@ export async function getProjectMetadata(collName: string): Promise<ProjectMetad
       filesTotal: (payload?.filesTotal as number) ?? (payload?.filesIndexed as number) ?? 0,
       filesIndexed: (payload?.filesIndexed as number) ?? 0,
       indexingStatus: (payload?.indexingStatus as IndexingStatus) ?? "completed",
+      ...(typeof payload.scanFailure === "string" ? { scanFailure: payload.scanFailure } : {}),
       effectiveProfile: profileFromPayload(
         payload as Record<string, unknown> | undefined,
         "code",
@@ -1644,6 +1708,37 @@ export async function getProjectMetadata(collName: string): Promise<ProjectMetad
       error: err instanceof Error ? err.message : String(err),
     });
     return null;
+  }
+}
+
+/** Лёгкий реестр для области проекта: без хешей файлов, векторов и содержимого графов. */
+export async function readProjectCatalogRecords(): Promise<Array<Record<string, unknown>>> {
+  const records: Array<Record<string, unknown>> = [];
+  let offset: string | number | Record<string, unknown> | null | undefined;
+  const seen = new Set<string>();
+  try {
+    do {
+      const page = await getClient().scroll(METADATA_COLLECTION, {
+        limit: 1000,
+        ...(offset != null ? { offset } : {}),
+        with_vector: false,
+        with_payload: { include: ["collectionName", "projectPath", "lastIndexedAt", "filesIndexed",
+          "filesTotal", "indexingStatus", "effectiveIndexProfile", "nodeCount", "edgeCount"] },
+      });
+      for (const point of page.points) {
+        if (point.payload && typeof point.payload === "object") records.push(point.payload);
+      }
+      offset = page.next_page_offset;
+      if (offset != null) {
+        const cursor = JSON.stringify(offset);
+        if (seen.has(cursor)) throw new Error("Repeated project catalog cursor");
+        seen.add(cursor);
+      }
+    } while (offset != null);
+    return records;
+  } catch (error) {
+    if (isNotFoundError(error)) return [];
+    throw wrapQdrantError("readProjectCatalogRecords", {}, error);
   }
 }
 
@@ -1735,6 +1830,7 @@ export async function saveGraphData(
           nodeCount: graph.nodes.length,
           edgeCount: graph.edges.length,
           importCount,
+          importCoverage: computeImportCoverage(graph),
           // What this build read, for the next incremental update to check a
           // change against before paying for a rebuild. Required rather than
           // optional: a graph saved without it reads as a graph nobody knows
@@ -1783,6 +1879,7 @@ export async function getGraphMetadata(graphCollName: string): Promise<{
   edgeCount: number;
   /** Absent on graphs persisted before this field was recorded. */
   importCount?: number;
+  importCoverage?: import("../types.js").ImportCoverage;
   /** SocratiCode version that built this graph. Absent on graphs persisted
    * before this field was recorded. */
   builtByVersion?: string;
@@ -1796,6 +1893,7 @@ export async function getGraphMetadata(graphCollName: string): Promise<{
       nodeCount: payload?.nodeCount as number,
       edgeCount: payload?.edgeCount as number,
       importCount: payload?.importCount as number | undefined,
+      importCoverage: readImportCoverage(payload?.importCoverage),
       builtByVersion: payload?.builtByVersion as string | undefined,
     };
   } catch (err) {

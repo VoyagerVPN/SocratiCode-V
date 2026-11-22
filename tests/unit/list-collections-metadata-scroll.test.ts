@@ -14,6 +14,7 @@
  * every indexed repository rather than with the number of projects.
  */
 
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 interface ScrollOptions {
@@ -267,9 +268,9 @@ describe("project reclamation inventory", () => {
       { id: 6, payload: { collectionName: "something_else_entirely", projectPath: "/foreign/project" } },
     ];
     mockRealpath.mockImplementation(async (value: string) => {
-      if (value === "/gone/project") throw Object.assign(new Error("missing"), { code: "ENOENT" });
-      if (value === "/blocked/project") throw Object.assign(new Error("denied"), { code: "EACCES" });
-      if (value === "/linked/project" || value === "/canonical/project") return "/canonical/project";
+      if (path.resolve(value) === path.resolve("/gone/project")) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      if (path.resolve(value) === path.resolve("/blocked/project")) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      if (path.resolve(value) === path.resolve("/linked/project") || path.resolve(value) === path.resolve("/canonical/project")) return path.resolve("/canonical/project");
       return value;
     });
 

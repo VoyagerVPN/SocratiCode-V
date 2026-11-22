@@ -27,7 +27,9 @@ RUNTIME DEPENDENCIES
 @lumis-sh/wasm-heex               MIT License
 @google/generative-ai             Apache License 2.0
 @hono/node-server                 MIT License
-@modelcontextprotocol/sdk         MIT License
+@modelcontextprotocol/server      Apache License 2.0
+@modelcontextprotocol/core        Apache License 2.0
+@modelcontextprotocol/node        Apache License 2.0
 @parcel/watcher                   MIT License
 @qdrant/js-client-rest            Apache License 2.0
 glob                              ISC License
@@ -46,6 +48,7 @@ DEVELOPMENT DEPENDENCIES
 ========================
 
 @biomejs/biome                    MIT License
+@modelcontextprotocol/client      Apache License 2.0
 @release-it/conventional-changelog MIT License
 release-it                        MIT License
 @types/node                       MIT License

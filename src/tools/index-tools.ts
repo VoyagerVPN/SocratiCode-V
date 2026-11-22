@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
+
+import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { collectionName, projectIdFromPath } from "../config.js";
 import { getWatcherMode, mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
-import { awaitGraphBuild, getGraphBuildInProgressProjects, invalidateGraphCache, invalidateGraphCacheForIdentity, isGraphBuildInProgress } from "../services/code-graph.js";
+import { awaitGraphBuild, ensureDynamicLanguages, getGraphBuildInProgressProjects, invalidateGraphCache, invalidateGraphCacheForIdentity, isGraphBuildInProgress } from "../services/code-graph.js";
 import { getContextIndexingInProgressProjects } from "../services/context-artifacts.js";
 import type { InfraProgressCallback } from "../services/docker.js";
 import { ensureQdrantReady, isDockerAvailable } from "../services/docker.js";
 import { finishGitIndex, gitRefreshStatus, prepareGitIndex, stopGitRefresh, withGitRefreshNotice } from "../services/git-refresh.js";
-import { ensureEffectiveEmbeddingReady } from "../services/index-profile.js";
-import { getIndexingInProgressProjects, getIndexingProgress, indexProject, invalidateProjectHashesForIdentity, isIndexingInProgress, removeProjectIndex, requestCancellation, setIndexingProgress, updateProjectIndex } from "../services/indexer.js";
+import { readIndexBudget } from "../services/index-budget.js";
+import { ensureEffectiveEmbeddingReady, profileExtensionLanguageMap, requestedIndexProfile } from "../services/index-profile.js";
+import { chunkFileContent, getIndexableFiles, getIndexingInProgressProjects, getIndexingProgress, indexProject, invalidateProjectHashesForIdentity, isIndexingInProgress, removeProjectIndex, requestCancellation, setIndexingProgress, updateProjectIndex } from "../services/indexer.js";
 import { isProjectIdentityLocked, isProjectLocked, terminateLockHolder } from "../services/lock.js";
 import { logger } from "../services/logger.js";
+import { attachProjectSource, getProjectCatalog } from "../services/project-catalog.js";
 import {
   getProjectReclamationInventory,
   loadEffectiveIndexProfileForCollection,
@@ -235,14 +240,48 @@ export async function reclaimProjectIdentity(
   }
 }
 
+
+async function previewIndexPlan(projectPath: string, extraExtensions: Set<string>, args: Record<string, unknown>): Promise<string> {
+  const budget = readIndexBudget(args);
+  ensureDynamicLanguages();
+  const profile = requestedIndexProfile("code");
+  const files = await getIndexableFiles(projectPath, extraExtensions.size ? extraExtensions : undefined, profileExtensionLanguageMap(profile));
+  let chunks = 0;
+  let bytes = 0;
+  let scannedFiles = 0;
+  let oversizedFiles = 0;
+  const contributors: Array<{ file: string; chunks: number; bytes: number }> = [];
+  let allowed = files.length <= budget.maxFiles;
+  if (allowed) for (const file of files) {
+    const absolute = path.join(projectPath, file);
+    const stat = await fsp.stat(absolute);
+    scannedFiles++;
+    if (stat.size > (profile.maxFileBytes ?? 0)) { oversizedFiles++; continue; }
+    const content = await fsp.readFile(absolute, "utf8");
+    const parts = chunkFileContent(absolute, file, content, { maxChunkChars: profile.maxChunkChars,
+      extensionLanguageMap: profileExtensionLanguageMap(profile), indexFormatVersion: profile.indexFormatVersion });
+    const size = parts.reduce((total, part) => total + Buffer.byteLength(part.content, "utf8"), 0);
+    chunks += parts.length;
+    bytes += size;
+    contributors.push({ file, chunks: parts.length, bytes: size });
+    contributors.sort((a, b) => b.chunks - a.chunks || b.bytes - a.bytes);
+    if (contributors.length > 5) contributors.pop();
+    if (chunks > budget.maxChunks || bytes > budget.maxBytes) { allowed = false; break; }
+  }
+  return JSON.stringify({ operation: "index_plan", projectPath, files: files.length, ...budget,
+    chunks, bytes, scannedFiles, complete: scannedFiles === files.length, oversizedFiles, allowed,
+    profile: "requested", contributors,
+    ...(typeof args.parentPath === "string" ? { parentPath: path.resolve(args.parentPath) } : {}) });
+}
+
 export async function handleIndexTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<string> {
   const projectPath = (args.projectPath as string) || process.cwd();
-  const progressMessages: string[] = [];
+  const updateWarnings: string[] = [];
   const onProgress = (msg: string) => {
-    progressMessages.push(msg);
+    if (/\b(?:failed|error|warning)\b|^Skipping large file|^No (?:existing index|metadata) found/i.test(msg)) updateWarnings.push(msg);
     logger.info(msg, { tool: name, projectPath });
   };
 
@@ -250,8 +289,28 @@ export async function handleIndexTool(
     case "codebase_index": {
       // Concurrency guard: if already indexing, return progress
       const resolved = path.resolve(projectPath);
-      if (isIndexingInProgress(resolved)) {
+      if (args.dryRun !== true && isIndexingInProgress(resolved)) {
         return formatIndexingInProgressMessage(resolved, "codebase_index");
+      }
+
+      // Предварительная оценка не запускает Docker, модель или запись конфигурации.
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return `Cannot index: directory not found: ${resolved}`;
+      const plannedExts = mergeExtraExtensions(typeof args.extraExtensions === "string" ? args.extraExtensions : undefined);
+      const planText = await previewIndexPlan(resolved, plannedExts, args);
+      if (args.dryRun === true) return planText;
+      const plan: unknown = JSON.parse(planText);
+      if (plan && typeof plan === "object" && "allowed" in plan && plan.allowed === false) return "Index limit exceeded: " + planText;
+
+      if (typeof args.parentPath === "string") {
+        try {
+          const catalog = await getProjectCatalog({ projectPath: resolved });
+          if (catalog.project?.index === "available") {
+            await attachProjectSource(args.parentPath, resolved);
+            return `Source connected; existing index retained: ${resolved}\nParent project: ${path.resolve(args.parentPath)}`;
+          }
+        } catch (error) {
+          return `Source attachment failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
       }
 
       // Check Docker availability before anything else (managed mode only)
@@ -260,22 +319,19 @@ export async function handleIndexTool(
       }
 
       // Set up infrastructure progress tracking so codebase_status shows what's happening
-      setIndexingProgress(resolved, {
-        type: "full-index",
+      const infrastructureProgress = {
+        type: "full-index" as const,
         startedAt: Date.now(),
         filesTotal: 0,
         filesProcessed: 0,
         phase: "preparing infrastructure",
-      });
+      };
+      setIndexingProgress(resolved, infrastructureProgress);
 
       const infraProgress: InfraProgressCallback = (msg) => {
-        setIndexingProgress(resolved, {
-          type: "full-index",
-          startedAt: Date.now(),
-          filesTotal: 0,
-          filesProcessed: 0,
-          phase: msg,
-        });
+        // Закрытая операция не может ожить или перезаписать прогресс следующей.
+        if (getIndexingProgress(resolved) !== infrastructureProgress) return;
+        infrastructureProgress.phase = msg;
         logger.info(msg, { tool: "codebase_index", projectPath: resolved });
       };
 
@@ -295,6 +351,14 @@ export async function handleIndexTool(
         logger.info(msg, { tool: "codebase_index", projectPath: resolved });
       };
       const extraExts = mergeExtraExtensions(args.extraExtensions as string | undefined);
+      if (typeof args.parentPath === "string") {
+        try {
+          await attachProjectSource(args.parentPath, resolved);
+        } catch (error) {
+          setIndexingProgress(resolved, null);
+          return `Source attachment failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
       const gitOperation = await prepareGitIndex(resolved, extraExts.size > 0 ? extraExts : undefined);
 
       // Clear infra progress — indexProject will set its own progress
@@ -329,9 +393,10 @@ export async function handleIndexTool(
       const lines = [
         ...infraMessages,
         `Indexing started in the background for: ${resolved}`,
+        ...(typeof args.parentPath === "string" ? [`Parent project: ${path.resolve(args.parentPath)}`] : []),
         "",
         "IMPORTANT: Indexing is now running asynchronously.",
-        "Call codebase_status to check progress. Keep calling it periodically until progress reaches 100%.",
+        "Call codebase_status until the operation is completed, including graph/artifact phases; 100% embeddings alone is not completion.",
         "Once complete, you can use codebase_search to query the indexed codebase.",
       ];
       if (getWatcherMode() === "git" && !gitOperation) lines.push("", gitRefreshStatus(resolved));
@@ -350,7 +415,7 @@ export async function handleIndexTool(
         return DOCKER_NOT_AVAILABLE_MESSAGE;
       }
 
-      const infraMessages = await ensureInfrastructure(resolved, onProgress);
+      await ensureInfrastructure(resolved, onProgress);
       const updateExtraExts = mergeExtraExtensions(args.extraExtensions as string | undefined);
       const gitOperation = await prepareGitIndex(resolved, updateExtraExts.size > 0 ? updateExtraExts : undefined);
       let result: Awaited<ReturnType<typeof updateProjectIndex>>;
@@ -362,15 +427,13 @@ export async function handleIndexTool(
         throw err;
       }
       const lines = [
-        ...infraMessages,
-        result.skipped ? `Index update skipped: ${result.skipped}` : `Updated project index: ${projectPath}`,
+        result.cancelled ? `Index update cancelled: ${projectPath}. Saved progress is preserved.`
+          : result.skipped ? `Index update skipped: ${result.skipped}` : `Updated project index: ${projectPath}`,
         `Added: ${result.added}`,
         `Updated: ${result.updated}`,
         `Removed: ${result.removed}`,
         `New chunks: ${result.chunksCreated}`,
-        "",
-        "Progress:",
-        ...progressMessages,
+        ...updateWarnings,
       ];
 
       // Auto-start watcher after successful update (not cancelled)
@@ -513,7 +576,7 @@ export async function handleIndexTool(
           `Cancellation requested for: ${resolved}`,
           `Current phase: ${phase} (batch ${batches}/${totalBatches})`,
           "",
-          "The indexing operation will stop after the current batch finishes and checkpoints.",
+          "The operation stops after the in-flight embedding packet. Uncommitted file-batch vectors are discarded; earlier checkpoints stay intact.",
           "All progress up to that point is preserved — re-run codebase_index to resume.",
         ].join("\n");
       }

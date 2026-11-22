@@ -218,8 +218,8 @@ export function ensureEffectiveEmbeddingReady(
     if (existing) return existing;
 
     const attempt = (async () => {
-      const provider = await getEmbeddingProvider(onProgress);
-      const result = await provider.ensureReady();
+      const provider = await getEmbeddingProvider();
+      const result = await provider.ensureReady(onProgress);
       embeddingReadyAt.set(key, Date.now());
       return result;
     })();

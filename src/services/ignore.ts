@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import fs from "node:fs";
 import path from "node:path";
+import type { IgnoreLike } from "glob";
 import ignore, { type Ignore } from "ignore";
 import { logger } from "./logger.js";
 
@@ -44,6 +45,8 @@ const DEFAULT_IGNORE_PATTERNS = [
   ".vscode",
   ".vs",
   "*.min.js",
+  "*.min.mjs",
+  "*.min.cjs",
   "*.min.css",
   "*.map",
   "*.lock",
@@ -62,6 +65,25 @@ const DEFAULT_IGNORE_PATTERNS = [
   "coverage",
   ".nyc_output",
   ".cache",
+  ".temp",
+  ".tmp",
+  ".tgrep",
+  ".npm",
+  ".pnpm-store",
+  ".yarn/cache",
+  ".yarn/unplugged",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".hypothesis",
+  "site-packages",
+  "dist-packages",
+  "*.egg-info",
+  "*.dist-info",
+  "*.tsbuildinfo",
+  ".svelte-kit",
+  ".angular/cache",
+  "CMakeFiles",
   ".parcel-cache",
   ".turbo",
   "vendor",
@@ -158,6 +180,11 @@ export function createIgnoreFilter(projectPath: string): IgnoreFilter {
 
   // Default patterns
   ig.add(DEFAULT_IGNORE_PATTERNS);
+  // Эти имена бывают исходниками; исключаем их только в подтверждённом Unity-проекте.
+  if (isFile(path.join(projectPath, "Packages", "manifest.json")) &&
+      isFile(path.join(projectPath, "ProjectSettings", "ProjectVersion.txt"))) {
+    ig.add(["/Library", "/Temp", "/Logs", "/UserSettings"]);
+  }
 
   // .gitignore (unless explicitly disabled)
   const respectGitignore = (process.env.RESPECT_GITIGNORE ?? "true").toLowerCase() !== "false";
@@ -178,15 +205,19 @@ export function createIgnoreFilter(projectPath: string): IgnoreFilter {
   // runs whether or not .gitignore is respected: a virtualenv is not a project
   // preference, it is a directory of installed libraries that no reading of the
   // tree should call source.
-  scanNestedIgnoreSources(projectPath, projectPath, ig, environments, respectGitignore, sources);
-
-  // .socraticodeignore
   const socraticodeignorePath = path.join(projectPath, ".socraticodeignore");
+  const projectRules = fs.existsSync(socraticodeignorePath)
+    ? fs.readFileSync(socraticodeignorePath, "utf-8")
+    : "";
+  // При обходе уже учитываем окончательные исключения и явные включения проекта.
+  // Основной фильтр сохраняет прежний порядок: вложенные правила, затем правила проекта.
+  const scanIg = ignore().add(ig).add(projectRules);
+  scanNestedIgnoreSources(projectPath, projectPath, ig, scanIg, projectRules,
+    environments, respectGitignore, sources);
 
   if (fs.existsSync(socraticodeignorePath)) {
-    const content = fs.readFileSync(socraticodeignorePath, "utf-8");
-    ig.add(content);
-    sources.push({ path: ".socraticodeignore", content });
+    ig.add(projectRules);
+    sources.push({ path: ".socraticodeignore", content: projectRules });
     logger.debug("Loaded .socraticodeignore rules");
   }
 
@@ -205,6 +236,22 @@ export function createIgnoreFilter(projectPath: string): IgnoreFilter {
     },
     sources,
     environments,
+  };
+}
+
+/** Отсекает исключённые каталоги до чтения их содержимого в glob. */
+export function createGlobIgnore(filter: IgnoreFilter, rootPath: string): IgnoreLike {
+  const hasNegations = filter.sources.some((source) =>
+    source.content.split("\n").some((line) => line.trim().startsWith("!")));
+  return {
+    childrenIgnored: (entry) => {
+      const relativePath = path.relative(rootPath, entry.fullpath()).split(path.sep).join("/");
+      if (!relativePath) return false;
+      // Литерал окружения допускает включение потомка без включения родителя.
+      // В таком случае проверяем файлы по отдельности, сохраняя прежнюю семантику.
+      if (hasNegations && isUnderAnEnvironment(relativePath, filter.environments)) return false;
+      return filter.ignores(`${relativePath}/`);
+    },
   };
 }
 
@@ -311,6 +358,8 @@ function scanNestedIgnoreSources(
   rootPath: string,
   currentPath: string,
   ig: Ignore,
+  scanIg: Ignore,
+  projectRules: string,
   environments: string[],
   readGitignores: boolean,
   sources: IgnoreSource[],
@@ -342,30 +391,8 @@ function scanNestedIgnoreSources(
       continue;
     }
 
-    // Skip directories we know should be ignored.
-    //
-    // `venv` is not among them by name any more, and that is the same decision
-    // as anchoring the default patterns rather than a separate one. Skipping it
-    // wherever it stood stopped this walk at any directory so called, so it never reached
-    // the marker of a real environment nested under one:
-    // `crates/venv/backend/env/` had its installed libraries indexed, because
-    // the walk turned back two levels above the `pyvenv.cfg` that would have
-    // excluded them, and a nested `.gitignore` below it stopped being read.
-    //
-    // `.venv` stays: the default patterns ignore that spelling at every depth,
-    // so descending into it would look for a marker in a directory already
-    // gone. The same argument holds for `venv` and `env` directly under the
-    // root, which `/venv` and `/env` above already exclude — a virtualenv old
-    // enough to have written no `pyvenv.cfg` would otherwise be walked to its
-    // `site-packages` reading `.gitignore` files for nothing. Only at the root:
-    // one level down those names are ordinary modules again.
-    if (dirName === "node_modules" || dirName === ".git" || dirName === ".svn" ||
-        dirName === ".hg" || dirName === "dist" || dirName === "build" ||
-        dirName === "__pycache__" || dirName === ".venv" ||
-        dirName === "target" || dirName === ".gradle" || dirName === ".next" ||
-        (currentPath === rootPath && (dirName === "venv" || dirName === "env"))) {
-      continue;
-    }
+    const relativeDir = path.relative(rootPath, dirPath).split(path.sep).join("/");
+    if (scanIg.ignores(`${relativeDir}/`)) continue;
 
     const gitignorePath = path.join(dirPath, ".gitignore");
 
@@ -393,11 +420,13 @@ function scanNestedIgnoreSources(
 
       if (prefixedPatterns.length > 0) {
         ig.add(prefixedPatterns);
+        scanIg.add(prefixedPatterns).add(projectRules);
       }
     }
 
     // Recurse into subdirectory
-    scanNestedIgnoreSources(rootPath, dirPath, ig, environments, readGitignores, sources);
+    scanNestedIgnoreSources(rootPath, dirPath, ig, scanIg, projectRules,
+      environments, readGitignores, sources);
   }
 }
 

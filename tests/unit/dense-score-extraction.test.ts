@@ -161,7 +161,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       .mockResolvedValueOnce({ points: [point("a.ts", [1, 0, 0])] }) // identical → 1
       .mockResolvedValueOnce({ points: [point("b.ts", [1, 1, 0])] }); // 45° → 1/√2
 
-    const results = await searchMultipleCollections(COLLECTIONS, "q", 10);
+    const { results } = await searchMultipleCollections(COLLECTIONS, "q", 10);
 
     expect(results.map((r) => r.relativePath)).toEqual(["a.ts", "b.ts"]);
     expect(results[0].score).toBeCloseTo(1, 10);
@@ -173,7 +173,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       .mockResolvedValueOnce({ points: [point("a.ts", { dense: [1, 0, 0], bm25: { indices: [1], values: [2] } })] })
       .mockResolvedValueOnce({ points: [point("b.ts", { dense: [1, 1, 0] })] });
 
-    const results = await searchMultipleCollections(COLLECTIONS, "q", 10);
+    const { results } = await searchMultipleCollections(COLLECTIONS, "q", 10);
 
     expect(results[0].score).toBeCloseTo(1, 10);
     expect(results[1].score).toBeCloseTo(Math.SQRT1_2, 10);
@@ -186,7 +186,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       .mockResolvedValueOnce({ points: [point("a.ts", [1, 0, 0])] })
       .mockResolvedValueOnce({ points: [point("b.ts", [1, 0, 0, 0, 0])] });
 
-    const results = await searchMultipleCollections(COLLECTIONS, "q", 10);
+    const { results } = await searchMultipleCollections(COLLECTIONS, "q", 10);
 
     expect(results).toHaveLength(2);
     expect(results.every((r) => Math.abs(r.score - RRF_RANK0) < 1e-9)).toBe(true);
@@ -203,7 +203,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       .mockResolvedValueOnce({ points: [point("a.ts", [1, 0, 0])] })
       .mockResolvedValueOnce({ points: [point("b.ts", [0, 0, 0])] });
 
-    const results = await searchMultipleCollections(COLLECTIONS, "q", 10);
+    const { results } = await searchMultipleCollections(COLLECTIONS, "q", 10);
 
     expect(results.every((r) => Math.abs(r.score - RRF_RANK0) < 1e-9)).toBe(true);
     expect(logger.warn).toHaveBeenCalled();
@@ -214,7 +214,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       .mockResolvedValueOnce({ points: [point("a.ts", [1, 0, 0])] })
       .mockResolvedValueOnce({ points: [point("b.ts", { bm25: { indices: [1], values: [2] } })] });
 
-    const results = await searchMultipleCollections(COLLECTIONS, "q", 10);
+    const { results } = await searchMultipleCollections(COLLECTIONS, "q", 10);
 
     expect(results.every((r) => Math.abs(r.score - RRF_RANK0) < 1e-9)).toBe(true);
   });
@@ -240,7 +240,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
     // byte-for-byte what it was: no vector on the wire, RRF score untouched.
     mockQuery.mockResolvedValueOnce({ points: [point("a.ts", undefined, 0.42)] });
 
-    const results = await searchMultipleCollections([COLLECTIONS[0]], "q", 10);
+    const { results } = await searchMultipleCollections([COLLECTIONS[0]], "q", 10);
 
     expect(results[0].score).toBeCloseTo(0.42, 10);
     expect(mockQuery.mock.calls[0][1]).not.toHaveProperty("with_vector");
@@ -361,7 +361,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       points: [point("healthy.ts", [1, 0, 0])],
     });
 
-    const results = await searchMultipleCollections(COLLECTIONS, "q", 10);
+    const { results } = await searchMultipleCollections(COLLECTIONS, "q", 10);
 
     expect(results.map((result) => result.relativePath)).toEqual(["healthy.ts"]);
     expect(mockQuery).toHaveBeenCalledOnce();
@@ -390,7 +390,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       points: [point("healthy.ts", [1, 0, 0])],
     });
 
-    const results = await searchMultipleCollections(COLLECTIONS, "q", 10);
+    const { results } = await searchMultipleCollections(COLLECTIONS, "q", 10);
 
     expect(results.map((result) => result.relativePath)).toEqual(["healthy.ts"]);
     expect(mockQuery).toHaveBeenCalledOnce();

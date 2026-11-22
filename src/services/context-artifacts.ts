@@ -1,3 +1,4 @@
+import { runWithIdleActivity } from "./idle-lifecycle.js";
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 /**
@@ -29,7 +30,7 @@ import {
   splitTextToCharCap,
 } from "./chunk-split.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
-import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import { createGlobIgnore, createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import {
   CURRENT_INDEX_FORMAT_VERSION,
   documentTextProfile,
@@ -268,6 +269,9 @@ export async function readArtifactContent(
   }
 
   if (stat.isDirectory()) {
+    // Корень фильтра — каталог артефакта: намеренно указанный build/openapi
+    // или .cache/references не исключает собственное содержимое по своему имени.
+    const ig = createIgnoreFilter(resolved);
     // Find all files in the directory (recursively, skip hidden/dot-files).
     // `dot: false` is not a stray default: it is why `.pytest_cache/` was
     // already excluded while `__pycache__/` — not hidden — was walked.
@@ -287,7 +291,7 @@ export async function readArtifactContent(
       cwd: resolved,
       nodir: true,
       dot: false,
-      ignore: ["**/node_modules/**", "**/.git/**"],
+      ignore: createGlobIgnore(ig, resolved),
     });
 
     files.sort(); // deterministic ordering
@@ -305,7 +309,6 @@ export async function readArtifactContent(
     // follows it is about 4% of the call — and a memo would have to fingerprint
     // every nested ignore file to stay correct, which costs as much as the
     // rebuild it avoids.
-    const ig = createIgnoreFilter(resolved);
 
     const parts: string[] = [];
     let ignoredCount = 0;
@@ -674,12 +677,12 @@ async function withContextWrite<T>(projectPath: string, write: () => Promise<T>,
 
 /** Index all artifacts defined in .socraticodecontextartifacts.json. */
 export function indexAllArtifacts(projectPath: string): ReturnType<typeof indexAllArtifactsUnguarded> {
-  return withContextWrite(projectPath, () => indexAllArtifactsUnguarded(projectPath));
+  return runWithIdleActivity(() => withContextWrite(projectPath, () => indexAllArtifactsUnguarded(projectPath)));
 }
 
 /** Re-index only the artifacts whose content or configuration changed. */
 export function ensureArtifactsIndexed(projectPath: string, projectId = projectIdFromPath(projectPath)): ReturnType<typeof ensureArtifactsIndexedUnguarded> {
-  return withContextWrite(projectPath, () => ensureArtifactsIndexedUnguarded(projectPath, projectId), projectId);
+  return runWithIdleActivity(() => withContextWrite(projectPath, () => ensureArtifactsIndexedUnguarded(projectPath, projectId), projectId));
 }
 
 /**

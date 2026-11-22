@@ -1,0 +1,35 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "socraticode",
+  "version": "1.16.1-local.10",
+  "description": "Local code search with Jina embeddings, shared stateless HTTP and bounded indexing",
+  "author": {
+    "name": "Giancarlo Erra",
+    "email": "giancarlo@altaire.com",
+    "url": "https://altaire.com"
+  },
+  "license": "AGPL-3.0-only",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "SocratiCode V",
+        "shortDescription": "Русский поиск кода на GPU",
+        "longDescription": "SocratiCode V provides shared local code search with Jina GPU embeddings, compact MCP responses and C++ and Unreal Engine graphs.",
+        "developerName": "VoyagerVPN",
+        "category": "Development",
+        "capabilities": [
+          "Read"
+        ],
+        "websiteURL": "https://github.com/VoyagerVPN/SocratiCode-V",
+        "privacyPolicyURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/v/SECURITY.md",
+        "termsOfServiceURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/v/LICENSE",
+        "defaultPrompt": [
+          "Use SocratiCode to search the codebase for authentication handling.",
+          "Use SocratiCode to visualize the dependency graph of this project."
+        ],
+        "composerIcon": "./assets/socrates-head.png",
+        "logo": "./assets/socrates-head.png"
+      }
+    }
+  }
+}

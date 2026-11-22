@@ -27,19 +27,27 @@ vi.mock("../../src/services/docker.js", () => ({
 // ── qdrant.js mock ───────────────────────────────────────────────────────
 
 import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
+import type { MultiCollectionSearchResult } from "../../src/services/qdrant.js";
 import type { SearchResult } from "../../src/types.js";
 
 const mockSearchChunks = vi.fn(async (_collection: string, _query: string, _limit: number): Promise<SearchResult[]> => []);
-const mockSearchMultipleCollections = vi.fn(async (): Promise<SearchResult[]> => []);
+const mockSearchMultipleCollections = vi.fn(async (): Promise<MultiCollectionSearchResult> => ({
+  results: [], searchedSources: [path.resolve("/tmp/test-project")], failedSources: [],
+}));
 const mockGetCollectionInfo = vi.fn(async (): Promise<{
   pointsCount: number;
   status: string;
   denseVectorSize?: number;
 } | null> => ({ pointsCount: 0, status: "green" }));
 const mockGetProjectMetadata = vi.fn(async () => null);
+const mockReadCatalog = vi.fn(async (): Promise<Array<Record<string, unknown>>> => [{
+  collectionName: "codebase_abc123", projectPath: path.resolve("/tmp/test-project"),
+  indexingStatus: "completed", effectiveIndexProfile: { source: "fresh" },
+}]);
 const mockLoadProjectEffectiveProfile = vi.fn(async (): Promise<EffectiveIndexProfile | null> => null);
 
 vi.mock("../../src/services/qdrant.js", () => ({
+  readProjectCatalogRecords: () => mockReadCatalog(),
   searchChunks: (...args: unknown[]) => mockSearchChunks(...(args as [string, string, number])),
   searchMultipleCollections: (...args: unknown[]) => mockSearchMultipleCollections(...(args as [])),
   getCollectionInfo: (...args: unknown[]) => mockGetCollectionInfo(...(args as [string])),
@@ -56,7 +64,7 @@ const mockResolveLinkedCollections = vi.fn(() => [
 ]);
 
 vi.mock("../../src/config.js", () => ({
-  collectionName: vi.fn(() => "test-collection"),
+  collectionName: vi.fn(() => "codebase_abc123"),
   projectIdFromPath: vi.fn(() => "test-project-id"),
   resolveLinkedCollections: (...args: unknown[]) => mockResolveLinkedCollections(...(args as [])),
 }));
@@ -116,9 +124,11 @@ vi.mock("../../src/constants.js", async (importOriginal) => {
 // ── Imports (after mocks) ────────────────────────────────────────────────
 
 import { ensureQdrantReady } from "../../src/services/docker.js";
+import { isIndexingInProgress } from "../../src/services/indexer.js";
 import { handleQueryTool } from "../../src/tools/query-tools.js";
 
 const mockEnsureQdrantReady = vi.mocked(ensureQdrantReady);
+const mockIsIndexingInProgress = vi.mocked(isIndexingInProgress);
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
@@ -279,22 +289,122 @@ describe("manual indexing watcher status", () => {
   });
 });
 
+describe("codebase_search — filtered search with no results", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 3, status: "green" });
+    mockSearchChunks.mockResolvedValueOnce([]);
+  });
+
+  afterEach(() => {
+    mockIsIndexingInProgress.mockReturnValue(false);
+  });
+
+  it("blames a fileFilter that matched no file, not the index", async () => {
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+      fileFilter: "src/",
+    });
+
+    expect(output).toContain('fileFilter "src/"');
+    expect(output).toContain("one file path exactly as a result header shows it");
+    expect(output).not.toContain("codebase_index");
+  });
+
+  it("blames a languageFilter that matched no language, not the index", async () => {
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+      languageFilter: "ts",
+    });
+
+    expect(output).toContain('languageFilter "ts"');
+    expect(output).toContain("language label exactly as a result header shows it in brackets");
+    expect(output).not.toContain("codebase_index");
+  });
+
+  it("blames both filters together when both are set, not the file path alone", async () => {
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+      fileFilter: "src/index.ts",
+      languageFilter: "python",
+    });
+
+    expect(output).toContain('fileFilter "src/index.ts" and languageFilter "python" together matched no indexed chunk');
+    expect(output).not.toContain("matched no indexed file");
+  });
+
+  it("states no cause for a filtered miss across the selected sources", async () => {
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 0, status: "green" });
+    mockReadCatalog.mockResolvedValueOnce([
+      { collectionName: "codebase_abc123", projectPath: path.resolve(TEST_PATH), indexingStatus: "completed", effectiveIndexProfile: { source: "fresh" } },
+      { collectionName: "codebase_def456", projectPath: path.resolve(TEST_PATH, "shared-lib"), indexingStatus: "completed", effectiveIndexProfile: { source: "fresh" } },
+    ]);
+    mockSearchMultipleCollections.mockResolvedValueOnce({ results: [], searchedSources: [path.resolve(TEST_PATH), path.resolve(TEST_PATH, "shared-lib")], failedSources: [] });
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+      fileFilter: "src/",
+      includeLinked: true,
+    });
+
+    expect(output).toContain('with fileFilter "src/"');
+    expect(output).toContain("one file path exactly as a result header shows it");
+    expect(output).not.toContain("matched no indexed");
+    expect(output).not.toContain("codebase_index");
+  });
+
+  it("says a correctly filtered file may not be indexed yet while indexing runs", async () => {
+    mockIsIndexingInProgress.mockReturnValue(true);
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 0, status: "green" });
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+      fileFilter: "src/index.ts",
+    });
+
+    expect(output).toContain('fileFilter "src/index.ts"');
+    expect(output).toContain("codebase_status");
+    expect(output).not.toContain("codebase_index");
+  });
+
+  it("keeps the indexing hint when the collection holds no chunks", async () => {
+    mockGetCollectionInfo.mockResolvedValue({ pointsCount: 0, status: "green" });
+
+    const output = await handleQueryTool("codebase_search", {
+      projectPath: TEST_PATH,
+      query: "value",
+      fileFilter: "src/index.ts",
+    });
+
+    expect(output).toContain("Make sure the project has been indexed first using codebase_index.");
+    expect(output).not.toContain("one file path exactly as a result header shows it");
+  });
+});
+
 // ── includeLinked tests ──────────────────────────────────────────────────
 
 describe("codebase_search — includeLinked parameter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockReadCatalog.mockResolvedValue([
+      { collectionName: "codebase_abc123", projectPath: path.resolve(TEST_PATH), indexingStatus: "completed", effectiveIndexProfile: { source: "fresh" } },
+      { collectionName: "codebase_def456", projectPath: path.resolve(TEST_PATH, "shared-lib"), indexingStatus: "completed", effectiveIndexProfile: { source: "fresh" } },
+    ]);
   });
 
-  it("calls searchChunks (not searchMultipleCollections) when includeLinked is omitted", async () => {
+  it("searches the project and registered nested sources when includeLinked is omitted", async () => {
     await handleQueryTool("codebase_search", {
       projectPath: TEST_PATH,
       query: "test query",
     });
 
-    expect(mockSearchChunks).toHaveBeenCalledOnce();
-    expect(mockSearchMultipleCollections).not.toHaveBeenCalled();
-    expect(mockResolveLinkedCollections).not.toHaveBeenCalled();
+    expect(mockSearchMultipleCollections).toHaveBeenCalledOnce();
+    expect(mockSearchChunks).not.toHaveBeenCalled();
   });
 
   it("calls searchChunks (not searchMultipleCollections) when includeLinked is false", async () => {
@@ -317,11 +427,11 @@ describe("codebase_search — includeLinked parameter", () => {
     });
 
     expect(mockSearchMultipleCollections).toHaveBeenCalledOnce();
-    expect(mockResolveLinkedCollections).toHaveBeenCalledOnce();
+    expect(mockReadCatalog).toHaveBeenCalledOnce();
     expect(mockSearchChunks).not.toHaveBeenCalled();
   });
 
-  it("passes collections from resolveLinkedCollections to searchMultipleCollections", async () => {
+  it("passes registered project paths to searchMultipleCollections", async () => {
     await handleQueryTool("codebase_search", {
       projectPath: TEST_PATH,
       query: "find me",
@@ -329,13 +439,10 @@ describe("codebase_search — includeLinked parameter", () => {
       limit: 5,
     });
 
-    expect(mockResolveLinkedCollections).toHaveBeenCalledWith(
-      expect.stringContaining(path.resolve(TEST_PATH)),
-    );
     expect(mockSearchMultipleCollections).toHaveBeenCalledWith(
       [
-        { name: "codebase_abc123", label: "my-project" },
-        { name: "codebase_def456", label: "shared-lib" },
+        { name: "codebase_abc123", label: path.resolve(TEST_PATH) },
+        { name: "codebase_def456", label: path.resolve(TEST_PATH, "shared-lib") },
       ],
       "find me",
       5,
@@ -345,7 +452,7 @@ describe("codebase_search — includeLinked parameter", () => {
   });
 
   it("includes project label in output when results have project field", async () => {
-    mockSearchMultipleCollections.mockResolvedValueOnce([
+    mockSearchMultipleCollections.mockResolvedValueOnce({ results: [
       {
         filePath: "/proj/src/index.ts",
         relativePath: "src/index.ts",
@@ -356,7 +463,7 @@ describe("codebase_search — includeLinked parameter", () => {
         score: 0.5,
         project: "shared-lib",
       },
-    ]);
+    ], searchedSources: [path.resolve(TEST_PATH, "shared-lib")], failedSources: [] });
 
     const output = await handleQueryTool("codebase_search", {
       projectPath: TEST_PATH,
@@ -384,6 +491,7 @@ describe("codebase_search — includeLinked parameter", () => {
     const output = await handleQueryTool("codebase_search", {
       projectPath: TEST_PATH,
       query: "hello",
+      scope: "main",
     });
 
     // Should have the file but no project tag brackets

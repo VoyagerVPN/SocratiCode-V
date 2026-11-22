@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { collectionName, contextCollectionName, graphCollectionName } from "../config.js";
 import { reclaimProjectIdentity } from "../tools/index-tools.js";
+import { runWithIdleActivity } from "./idle-lifecycle.js";
 import { assertLocalCleanupStore, assertLocalIndexRetired, automaticCleanupEnabled, parseLocalIndexOwnership } from "./local-index-ownership.js";
 import { logger } from "./logger.js";
 import { getProjectReclamationInventory, type ProjectReclamationEntry } from "./qdrant.js";
@@ -59,7 +60,7 @@ export function startAutomaticCleanup(): void {
   stopped = false;
   const sweep = () => {
     if (stopped || pending) return;
-    pending = runAutomaticCleanup(() => !stopped).then((results) => {
+    pending = runWithIdleActivity(() => runAutomaticCleanup(() => !stopped)).then((results) => {
       for (const result of results) {
         if (result.startsWith("Removed")) logger.info("Automatic index cleanup", { result });
         else logger.warn("Automatic index cleanup", { result });

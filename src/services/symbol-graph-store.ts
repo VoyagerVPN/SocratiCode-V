@@ -15,6 +15,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import type { QdrantClient } from "@qdrant/js-client-rest";
 import {
   symgraphFileCollectionName,
   symgraphIndexCollectionName,
@@ -31,7 +32,58 @@ import type {
   SymbolRef,
 } from "../types.js";
 import { logger } from "./logger.js";
-import { getClient, isAlreadyExistsError } from "./qdrant.js";
+import { describeQdrantError, getClient, isAlreadyExistsError } from "./qdrant.js";
+
+/** True when the error's cause chain holds undici's closed-socket error. */
+function isClosedSocketError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current; depth++) {
+    if ((current as { code?: unknown }).code === "UND_ERR_SOCKET") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * Run a Qdrant request, and run it once more if it failed on a connection the
+ * server had already closed. Every other failure, and a second failure,
+ * propagate unchanged.
+ */
+async function retryOnClosedSocket<T>(operation: string, request: () => Promise<T>): Promise<T> {
+  try {
+    return await request();
+  } catch (err) {
+    if (!isClosedSocketError(err)) throw err;
+    logger.warn("Symbol-graph Qdrant request hit a connection the server had closed; retrying once", { operation });
+    return request();
+  }
+}
+
+type SymbolStoreClient = Pick<
+  QdrantClient,
+  "getCollections" | "createCollection" | "deleteCollection" | "upsert" | "retrieve" | "delete" | "scroll"
+>;
+
+/**
+ * The Qdrant client every symbol-store request goes through.
+ *
+ * A closed-socket failure can follow a request the server already applied, and
+ * the retry sends it again. A method belongs here only if a repeat leaves the
+ * same end state; a repeated `createCollection` answers "already exists", and
+ * its caller must accept that reply.
+ */
+function storeClient(): SymbolStoreClient {
+  const qdrant = getClient();
+  return {
+    getCollections: (...args) => retryOnClosedSocket("getCollections", () => qdrant.getCollections(...args)),
+    createCollection: (...args) => retryOnClosedSocket("createCollection", () => qdrant.createCollection(...args)),
+    deleteCollection: (...args) => retryOnClosedSocket("deleteCollection", () => qdrant.deleteCollection(...args)),
+    upsert: (...args) => retryOnClosedSocket("upsert", () => qdrant.upsert(...args)),
+    retrieve: (...args) => retryOnClosedSocket("retrieve", () => qdrant.retrieve(...args)),
+    delete: (...args) => retryOnClosedSocket("delete", () => qdrant.delete(...args)),
+    scroll: (...args) => retryOnClosedSocket("scroll", () => qdrant.scroll(...args)),
+  };
+}
 
 // ── Shard key helpers ────────────────────────────────────────────────────
 
@@ -176,7 +228,7 @@ async function upsertWithinBudget(
   points: SymgraphPoint[],
   describe: (index: number) => string,
 ): Promise<void> {
-  const qdrant = getClient();
+  const qdrant = storeClient();
   let batch: SymgraphPoint[] = [];
   let batchBytes = 0;
 
@@ -282,7 +334,7 @@ async function saveShardPoints<V>(
   payloadFor: (entries: Record<string, V>, part: number, parts: number) => Record<string, unknown>,
   generation?: string,
 ): Promise<void> {
-  const qdrant = getClient();
+  const qdrant = storeClient();
 
   const single: SymgraphPoint = {
     id: primaryId,
@@ -374,18 +426,14 @@ export const LEGACY_SYMBOL_GRAPH_GENERATION = "__legacy_symbol_graph__";
  * merged entries, or null when genuinely absent (primary point missing), or
  * throws StorageReadError when a declared part or payload is corrupted/missing.
  */
-async function loadShardPoints<V>(
+async function readShardPayload<V>(
   collName: string,
   primaryKey: string,
-  primaryId: string,
+  payload: Record<string, unknown> | null | undefined,
   entriesOf: (payload: Record<string, unknown> | null | undefined) => Record<string, V> | null,
   logContext: Record<string, unknown>,
-): Promise<Record<string, V> | null> {
-  const qdrant = getClient();
-  const primary = await qdrant.retrieve(collName, { ids: [primaryId], with_payload: true });
-  if (primary.length === 0) return null;
-
-  const payload = primary[0].payload as Record<string, unknown> | null | undefined;
+): Promise<Record<string, V>> {
+  const qdrant = storeClient();
   const first = entriesOf(payload);
   if (first === null) {
     throw new StorageReadError("Shard primary payload is malformed or missing entries", logContext);
@@ -495,7 +543,7 @@ async function ensureCollection(name: string): Promise<void> {
   if (current) return current;
 
   const attempt = (async () => {
-    const qdrant = getClient();
+    const qdrant = storeClient();
     const collections = await qdrant.getCollections();
     const exists = collections.collections.some((c) => c.name === name);
     if (!exists) {
@@ -503,6 +551,8 @@ async function ensureCollection(name: string): Promise<void> {
         await qdrant.createCollection(name, {
           vectors: { size: 1, distance: "Cosine" },
           on_disk_payload: true,
+          // Граф читает записи по ID. Дополнительные сегменты увеличивают размер небольших коллекций.
+          optimizers_config: { default_segment_number: 1 },
         });
         logger.info("Created symbol-graph collection", { name });
       } catch (err) {
@@ -546,7 +596,7 @@ export async function saveSymbolGraphMeta(
 ): Promise<void> {
   const collName = symgraphMetaCollectionName(projectId);
   await ensureCollection(collName);
-  const qdrant = getClient();
+  const qdrant = storeClient();
   const point: SymgraphPoint = { id: metaPointId(projectId), vector: [0], payload: { meta } };
   // Counters only, so it cannot realistically overflow — guarded anyway so
   // this file has no unguarded upsert path (#99).
@@ -561,7 +611,7 @@ export async function loadSymbolGraphMeta(
   try {
     const collName = symgraphMetaCollectionName(projectId);
     await ensureCollection(collName);
-    const qdrant = getClient();
+    const qdrant = storeClient();
     const points = await qdrant.retrieve(collName, {
       ids: [metaPointId(projectId)],
       with_payload: true,
@@ -604,7 +654,7 @@ export async function saveFilePayload(
 ): Promise<void> {
   const collName = symgraphFileCollectionName(projectId);
   await ensureCollection(collName);
-  const qdrant = getClient();
+  const qdrant = storeClient();
   const point: SymgraphPoint = {
     id: filePointId(projectId, payload.file, generation),
     vector: [0],
@@ -651,7 +701,7 @@ export async function loadFilePayload(
     const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
-    const qdrant = getClient();
+    const qdrant = storeClient();
     const points = await qdrant.retrieve(collName, {
       ids: [filePointId(projectId, relativePath, gen)],
       with_payload: true,
@@ -681,7 +731,7 @@ export async function deleteFilePayload(
     const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
-    const qdrant = getClient();
+    const qdrant = storeClient();
     await qdrant.delete(collName, {
       points: [filePointId(projectId, relativePath, gen)],
     });
@@ -723,29 +773,47 @@ export async function saveNameShard(
   );
 }
 
-export async function loadNameShard(
-  projectId: string,
-  shardKey: string,
-  generation?: string,
-): Promise<Record<string, SymbolRef[]> | null> {
+async function loadIndexShards<K extends string | number, V>(
+  projectId: string, keys: readonly K[], generation: string | undefined,
+  seed: (key: K, gen?: string) => string,
+  pointId: (key: K, gen?: string) => string,
+  entriesOf: (payload: Record<string, unknown> | null | undefined) => Record<string, V> | null,
+): Promise<Array<Record<string, V> | null>> {
   try {
     const gen = await resolveReadGeneration(projectId, generation);
-    const collName = symgraphIndexCollectionName(projectId);
-    await ensureCollection(collName);
-    return await loadShardPoints<SymbolRef[]>(
-      collName,
-      nameShardSeed(projectId, shardKey, gen),
-      nameShardPointId(projectId, shardKey, gen),
-      (payload) => (payload?.nameToSymbols as Record<string, SymbolRef[]>) ?? null,
-      { projectId, shardKey },
-    );
+    const collection = symgraphIndexCollectionName(projectId);
+    await ensureCollection(collection);
+    const client = storeClient();
+    const shards: Array<Record<string, V> | null> = [];
+    // Первичные точки запрашиваем группами, ограничивая число соединений и размер ответа.
+    const batchSize = 4;
+    for (let i = 0; i < keys.length; i += batchSize) {
+      const batch = keys.slice(i, i + batchSize);
+      const ids = batch.map(key => pointId(key, gen));
+      const points = await client.retrieve(collection, { ids, with_payload: true });
+      const byId = new Map(points.map(point => [point.id, point]));
+      for (const [index, key] of batch.entries()) {
+        const point = byId.get(ids[index]);
+        const context = typeof key === "string" ? { projectId, shardKey: key } : { projectId, bucket: key };
+        shards.push(point ? await readShardPayload(collection, seed(key, gen), point.payload, entriesOf, context) : null);
+      }
+    }
+    return shards;
   } catch (err) {
     if (err instanceof StorageReadError) throw err;
-    throw new StorageReadError(
-      `loadNameShard failed for shard '${shardKey}': ${err instanceof Error ? err.message : String(err)}`,
-      { projectId, shardKey },
-    );
+    throw new StorageReadError(`Symbol index shard read failed: ${describeQdrantError(err)}`, { projectId });
   }
+}
+
+export function loadNameShards(projectId: string, keys: readonly string[], generation?: string) {
+  return loadIndexShards(projectId, keys, generation,
+    (key, gen) => nameShardSeed(projectId, key, gen),
+    (key, gen) => nameShardPointId(projectId, key, gen),
+    payload => (payload?.nameToSymbols as Record<string, SymbolRef[]>) ?? null);
+}
+
+export async function loadNameShard(projectId: string, key: string, generation?: string) {
+  return (await loadNameShards(projectId, [key], generation))[0];
 }
 
 // ── Reverse-call file index shards ───────────────────────────────────────
@@ -773,30 +841,15 @@ export async function saveReverseShard(
   );
 }
 
-export async function loadReverseShard(
-  projectId: string,
-  bucket: number,
-  generation?: string,
-): Promise<Record<string, string[]> | null> {
-  try {
-    const gen = await resolveReadGeneration(projectId, generation);
-    const collName = symgraphIndexCollectionName(projectId);
-    await ensureCollection(collName);
-    const bucketHex = reverseShardHex(bucket);
-    return await loadShardPoints<string[]>(
-      collName,
-      revShardSeed(projectId, bucketHex, gen),
-      revShardPointId(projectId, bucketHex, gen),
-      (payload) => (payload?.reverseEdges as Record<string, string[]>) ?? null,
-      { projectId, bucket },
-    );
-  } catch (err) {
-    if (err instanceof StorageReadError) throw err;
-    throw new StorageReadError(
-      `loadReverseShard failed for bucket ${bucket}: ${err instanceof Error ? err.message : String(err)}`,
-      { projectId, bucket },
-    );
-  }
+export function loadReverseShards(projectId: string, buckets: readonly number[], generation?: string) {
+  return loadIndexShards(projectId, buckets, generation,
+    (bucket, gen) => revShardSeed(projectId, reverseShardHex(bucket), gen),
+    (bucket, gen) => revShardPointId(projectId, reverseShardHex(bucket), gen),
+    payload => (payload?.reverseEdges as Record<string, string[]>) ?? null);
+}
+
+export async function loadReverseShard(projectId: string, bucket: number, generation?: string) {
+  return (await loadReverseShards(projectId, [bucket], generation))[0];
 }
 
 // ── Generation lifecycle and coordination ───────────────────────────────
@@ -977,7 +1030,7 @@ export function resetGenerationLifecycleState(): void {
 /** Delete all points belonging to a specific generation from file and index collections. */
 export async function deleteGeneration(projectId: string, generation: string): Promise<void> {
   if (!generation) return;
-  const qdrant = getClient();
+  const qdrant = storeClient();
   const collNames = [
     symgraphFileCollectionName(projectId),
     symgraphIndexCollectionName(projectId),
@@ -1003,7 +1056,7 @@ export async function deleteGeneration(projectId: string, generation: string): P
 
 /** Find all distinct generation IDs present in storage for a project. */
 export async function listStoredGenerations(projectId: string): Promise<string[]> {
-  const qdrant = getClient();
+  const qdrant = storeClient();
   const generations = new Set<string>();
   const collNames = [
     symgraphFileCollectionName(projectId),
@@ -1081,7 +1134,7 @@ export async function cleanStaleGenerations(
 
 /** Delete all symbol-graph data for a project (best-effort). */
 export async function deleteSymbolGraphData(projectId: string): Promise<void> {
-  const qdrant = getClient();
+  const qdrant = storeClient();
   const names = [
     symgraphMetaCollectionName(projectId),
     symgraphFileCollectionName(projectId),

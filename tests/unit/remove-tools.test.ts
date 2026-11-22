@@ -10,7 +10,10 @@
  * All external services are mocked — no Docker required.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ────────────────────────────────────────────────────────────────
 
@@ -44,6 +47,7 @@ const mockGetIndexingInProgressProjects = vi.fn((): string[] => []);
 const mockInvalidateProjectHashesForIdentity = vi.fn((_identity: string) => {});
 
 vi.mock("../../src/services/indexer.js", () => ({
+  getIndexableFiles: vi.fn(async () => []),
   isIndexingInProgress: (...args: unknown[]) => mockIsIndexingInProgress(...(args as [string])),
   requestCancellation: (...args: unknown[]) => mockRequestCancellation(...(args as [string])),
   removeProjectIndex: (...args: unknown[]) => mockRemoveProjectIndex(...(args as [string])),
@@ -66,6 +70,7 @@ const mockGetGraphBuildInProgressProjects = vi.fn((): string[] => []);
 const mockInvalidateGraphCacheForIdentity = vi.fn((_identity: string) => {});
 
 vi.mock("../../src/services/code-graph.js", () => ({
+  ensureDynamicLanguages: vi.fn(),
   isGraphBuildInProgress: (...args: unknown[]) => mockIsGraphBuildInProgress(...(args as [string])),
   awaitGraphBuild: (...args: unknown[]) => mockAwaitGraphBuild(...(args as [string])),
   invalidateGraphCache: vi.fn(),
@@ -113,7 +118,8 @@ vi.mock("../../src/services/docker.js", () => ({
 
 // ── embedding mocks ─────────────────────────────────────────────────────
 
-vi.mock("../../src/services/embedding-config.js", () => ({
+vi.mock("../../src/services/embedding-config.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   getEmbeddingConfig: vi.fn(() => ({ embeddingModel: "test-model" })),
 }));
 
@@ -222,7 +228,8 @@ import { handleIndexTool } from "../../src/tools/index-tools.js";
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-const TEST_PATH = "/tmp/test-project";
+const TEST_PATH = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-remove-tools-"));
+afterAll(() => fs.rmSync(TEST_PATH, { recursive: true, force: true }));
 
 function reclamationEntry(overrides: Record<string, unknown> = {}) {
   return {

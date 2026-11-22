@@ -15,7 +15,6 @@
  *   - litellm  — LiteLLM proxy (OpenAI-compatible gateway in front of 100+ providers)
  */
 
-import type { InfraProgressCallback } from "./docker.js";
 import { getEmbeddingConfig, type EmbeddingProvider as ProviderName } from "./embedding-config.js";
 import { logger } from "./logger.js";
 
@@ -32,9 +31,8 @@ let _providerName: ProviderName | null = null;
 /**
  * Get (or create) the active embedding provider singleton.
  * Provider is selected based on EMBEDDING_PROVIDER env var.
- * @param onProgress Optional callback for reporting infrastructure setup progress
  */
-export async function getEmbeddingProvider(onProgress?: InfraProgressCallback): Promise<EmbeddingProvider> {
+export async function getEmbeddingProvider(): Promise<EmbeddingProvider> {
   const config = getEmbeddingConfig();
 
   // Recreate if provider changed (e.g. after config reset in tests)
@@ -49,7 +47,7 @@ export async function getEmbeddingProvider(onProgress?: InfraProgressCallback): 
     case "ollama": {
       // Dynamic imports avoid loading all provider SDKs at startup.
       const { OllamaEmbeddingProvider } = await import("./provider-ollama.js");
-      _provider = new OllamaEmbeddingProvider(onProgress);
+      _provider = new OllamaEmbeddingProvider();
       break;
     }
     case "openai": {

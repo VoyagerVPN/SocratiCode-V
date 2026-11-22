@@ -8,13 +8,19 @@
  */
 
 import { MAX_FLOW_DEPTH, MAX_IMPACT_DEPTH, toForwardSlash } from "../constants.js";
-import type { SymbolNode } from "../types.js";
+import type { SymbolNode, SymbolRef } from "../types.js";
 import {
   type SymbolGraphCache,
   type SymbolGraphReaderToken,
   symbolIdToFile,
 } from "./symbol-graph-cache.js";
 import { StorageReadError } from "./symbol-graph-store.js";
+
+function matchFileHint(refs: SymbolRef[], hint: string): SymbolRef[] {
+  const file = toForwardSlash(hint);
+  const exact = refs.filter(ref => ref.file === file);
+  return exact.length ? exact : refs.filter(ref => ref.file.endsWith(`/${file}`));
+}
 
 // ── Impact (blast radius) ────────────────────────────────────────────────
 
@@ -30,6 +36,8 @@ export interface ImpactOptions {
   file?: string;
   symbolId?: string;
   isIncomplete?: boolean;
+  /** Maximum ambiguous candidates to return, as a positive integer; all when omitted. */
+  limit?: number;
 }
 
 export interface ImpactResult {
@@ -42,7 +50,10 @@ export interface ImpactResult {
   truncated: boolean;
   status: ImpactStatus;
   message?: string;
+  /** Set when `status` is "ambiguous": the matching symbols, at most `ImpactOptions.limit` of them. */
   candidates?: SymbolNode[];
+  /** Set when `status` is "ambiguous": the number of matches after the file filter, including those not in `candidates`. */
+  totalCandidates?: number;
 }
 
 /** BFS over symbol call/reference graph or reverseFileIndex. Polymorphic on target type. */
@@ -180,8 +191,7 @@ export async function getImpactRadius(
       let refs = nameIndex.get(target) ?? [];
 
       if (options?.file) {
-        const normFile = toForwardSlash(options.file);
-        refs = refs.filter((r) => r.file === normFile || r.file.endsWith(`/${normFile}`));
+        refs = matchFileHint(refs, options.file);
       }
 
       if (refs.length === 0) {
@@ -201,6 +211,7 @@ export async function getImpactRadius(
       if (distinctIds.length > 1) {
         const candidates: SymbolNode[] = [];
         for (const ref of refs) {
+          if (options?.limit !== undefined && candidates.length >= options.limit) break;
           const payload = await cache.getFilePayload(ref.file, readerToken);
           const sym = payload?.symbols.find((s) => s.id === ref.id);
           if (sym) candidates.push(sym);
@@ -220,6 +231,7 @@ export async function getImpactRadius(
           status: "ambiguous",
           message: `Symbol '${target}' is ambiguous (matches ${distinctIds.length} symbols ${locDesc}). Specify 'file' or 'symbolId' to disambiguate.`,
           candidates,
+          totalCandidates: refs.length,
         };
       }
       selectedRefs = refs;
@@ -433,6 +445,8 @@ export interface FlowNode {
   file: string;
   line: number;
   children: FlowNode[];
+  via?: string;
+  unrealRpc?: SymbolNode["unrealRpc"];
   /** True if the recursion stopped here due to depth or cycle. */
   truncatedReason?: "depth" | "cycle";
 }
@@ -473,6 +487,7 @@ async function walk(
   const node: FlowNode = {
     symbolId: sym.id,
     symbolName: sym.qualifiedName,
+    ...(sym.unrealRpc ? { unrealRpc: sym.unrealRpc } : {}),
     file: sym.file,
     line: sym.line,
     children: [],
@@ -502,14 +517,16 @@ async function walk(
       if (!calleePayload) continue;
       const calleeSym = calleePayload.symbols.find((s) => s.id === calleeId);
       if (!calleeSym) continue;
-      node.children.push(await walk(
+      const child = await walk(
         cache,
         calleeSym,
         hop + 1,
         maxDepth,
         visited,
         readerToken,
-      ));
+      );
+      if (e.cpp?.label) child.via = e.cpp.label;
+      node.children.push(child);
     }
   }
   return node;
@@ -537,26 +554,53 @@ export interface SymbolContext {
   callees: SymbolContextCallee[];
 }
 
+export interface SymbolContextResult {
+  /** Context for the matching definitions that resolve, at most the `limit` passed to `getSymbolContextResult`. */
+  contexts: SymbolContext[];
+  /** Number of definitions that match the name and file hint. */
+  total: number;
+  /** Number of distinct files those definitions are in. */
+  fileCount: number;
+}
+
+/**
+ * Resolve definition, callers and callees for the definitions named `name`,
+ * optionally narrowed by `fileHint`.
+ */
 export async function getSymbolContext(
   cache: SymbolGraphCache,
   name: string,
   fileHint?: string,
 ): Promise<SymbolContext[]> {
+  return (await getSymbolContextResult(cache, name, fileHint)).contexts;
+}
+
+/**
+ * Resolve definition, callers and callees for the definitions named `name`,
+ * optionally narrowed by `fileHint`, with the match counts. With `limit`, a
+ * positive integer, resolution stops once `limit` definitions are resolved.
+ */
+export async function getSymbolContextResult(
+  cache: SymbolGraphCache,
+  name: string,
+  fileHint?: string,
+  limit?: number,
+): Promise<SymbolContextResult> {
   const release = cache.acquireReader();
   const readerToken = release.token;
   try {
     const nameIndex = await cache.getNameIndex(readerToken);
     let refs = nameIndex.get(name) ?? [];
     if (fileHint) {
-      const normalizedHint = toForwardSlash(fileHint);
-      refs = refs.filter((r) => r.file === normalizedHint || r.file.endsWith(`/${normalizedHint}`));
+      refs = matchFileHint(refs, fileHint);
     }
-    if (refs.length === 0) return [];
+    if (refs.length === 0) return { contexts: [], total: 0, fileCount: 0 };
 
     const reverseSymbolIndex = await cache.getReverseSymbolIndex(readerToken);
     const out: SymbolContext[] = [];
 
     for (const ref of refs) {
+      if (limit !== undefined && out.length >= limit) break;
       const payload = await cache.getFilePayload(ref.file, readerToken);
       if (!payload) continue;
       const sym = payload.symbols.find((s) => s.id === ref.id);
@@ -628,7 +672,7 @@ export async function getSymbolContext(
 
       out.push({ symbol: sym, callers, callees });
     }
-    return out;
+    return { contexts: out, total: refs.length, fileCount: new Set(refs.map((r) => r.file)).size };
   } finally {
     release();
   }
@@ -680,4 +724,37 @@ export async function listSymbols(
 /** Detect whether a target string looks like a file path vs a symbol name. */
 export function looksLikeFilePath(s: string): boolean {
   return s.includes("/") || s.includes("\\") || /\.[a-z]{1,5}$/i.test(s);
+}
+
+/** Полный счёт из name index, загрузка payload только для выбранной страницы. */
+export async function listSymbolPage(
+  cache: SymbolGraphCache,
+  opts: { file?: string; query?: string; offset: number; limit: number },
+): Promise<{ symbols: SymbolNode[]; total: number }> {
+  const release = cache.acquireReader();
+  try {
+    if (opts.file) {
+      const payload = await cache.getFilePayload(toForwardSlash(opts.file), release.token);
+      const symbols = (payload?.symbols ?? []).filter((s) => s.name !== "<module>").sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+      return { symbols: symbols.slice(opts.offset, opts.offset + opts.limit), total: symbols.length };
+    }
+    const index = await cache.getNameIndex(release.token);
+    const query = opts.query?.toLowerCase() ?? "";
+    const refs = new Map<string, { id: string; file: string }>();
+    for (const [name, matches] of index) {
+      if (name === "<module>" || (query && !name.toLowerCase().includes(query))) continue;
+      for (const ref of matches) refs.set(ref.id, ref);
+    }
+    const ordered = [...refs.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const symbols: SymbolNode[] = [];
+    for (const ref of ordered.slice(opts.offset, opts.offset + opts.limit)) {
+      const payload = await cache.getFilePayload(ref.file, release.token);
+      const symbol = payload?.symbols.find((s) => s.id === ref.id);
+      if (!symbol) throw new Error("Symbol payload is missing for " + ref.id + ". Graph result is incomplete.");
+      symbols.push(symbol);
+    }
+    return { symbols, total: ordered.length };
+  } finally {
+    release();
+  }
 }

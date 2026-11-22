@@ -33,6 +33,10 @@ vi.mock("../../src/services/logger.js", () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock("../../src/services/docker.js", () => ({
+  ensureQdrantReady: vi.fn(async () => ({ pulled: false, started: false })),
+}));
+
 vi.mock("../../src/services/qdrant-client-compat.js", () => ({
   ensureQdrantClientCompatibility: vi.fn(),
 }));

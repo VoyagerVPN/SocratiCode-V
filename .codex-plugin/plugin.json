@@ -1,14 +1,14 @@
 {
   "name": "socraticode",
-  "version": "1.16.0",
+  "version": "1.16.1-local.9",
   "description": "Codebase intelligence: semantic search workflows, dependency graph analysis, and context artifact exploration for SocratiCode",
   "author": {
     "name": "Giancarlo Erra",
     "email": "giancarlo@altaire.com",
     "url": "https://altaire.com"
   },
-  "homepage": "https://github.com/giancarloerra/socraticode",
-  "repository": "https://github.com/giancarloerra/socraticode",
+  "homepage": "https://github.com/VoyagerVPN/SocratiCode-V",
+  "repository": "https://github.com/VoyagerVPN/SocratiCode-V",
   "license": "AGPL-3.0-only",
   "keywords": [
     "codebase",
@@ -21,17 +21,17 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "SocratiCode",
+    "displayName": "SocratiCode V",
     "shortDescription": "Codebase intelligence: semantic search, dependency graphs, and context artifacts",
-    "longDescription": "SocratiCode provides codebase intelligence through semantic search workflows, dependency graph analysis, and context artifact exploration. Index your codebase, search with hybrid semantic + keyword search, visualize module dependencies, and manage context artifacts.",
-    "developerName": "Giancarlo Erra",
+    "longDescription": "SocratiCode V provides shared local code search with Jina GPU embeddings, compact MCP responses and C++ and Unreal Engine graphs.",
+    "developerName": "VoyagerVPN",
     "category": "Development",
     "capabilities": [
       "Read"
     ],
-    "websiteURL": "https://github.com/giancarloerra/socraticode",
-    "privacyPolicyURL": "https://github.com/giancarloerra/socraticode/blob/main/SECURITY.md",
-    "termsOfServiceURL": "https://github.com/giancarloerra/socraticode/blob/main/LICENSE",
+    "websiteURL": "https://github.com/VoyagerVPN/SocratiCode-V",
+    "privacyPolicyURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/v/SECURITY.md",
+    "termsOfServiceURL": "https://github.com/VoyagerVPN/SocratiCode-V/blob/v/LICENSE",
     "defaultPrompt": [
       "Use SocratiCode to search the codebase for authentication handling.",
       "Use SocratiCode to visualize the dependency graph of this project."

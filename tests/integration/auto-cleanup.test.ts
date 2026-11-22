@@ -7,9 +7,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { LoggingMessageNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createGitFixture, git } from "../helpers/git.js";
 
@@ -236,33 +235,39 @@ describe.skipIf(!reachable)("automatic cleanup through real Git, Qdrant and writ
     if (!fs.existsSync(entrypoint)) throw new Error("Run npm run build before the MCP cleanup integration test");
     const notifications: string[] = [];
     async function launch() {
-      const mcp = new Client({ name: "automatic-cleanup-fixture", version: "1.0.0" });
-      mcp.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => { notifications.push(String(notification.params.data)); });
+      const mcp = new Client({ name: "automatic-cleanup-fixture", version: "1.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
       const transport = new StdioClientTransport({
         command: process.execPath, args: [entrypoint], cwd: fixture.root, stderr: "pipe",
         env: {
           HOME: path.join(fixture.root, ".owner-home"), USERPROFILE: path.join(fixture.root, ".owner-home"),
           TMPDIR: os.tmpdir(), TMP: os.tmpdir(), TEMP: os.tmpdir(),
           SOCRATICODE_AUTO_CLEANUP: "local", SOCRATICODE_AUTO_RESUME: "off", SOCRATICODE_WATCHER: "off",
+          SOCRATICODE_IDLE_STOP_TIMEOUT_MS: "off",
           SOCRATICODE_PROJECT_ID: "", SOCRATICODE_BRANCH_AWARE: "false", QDRANT_COLLECTION_PREFIX: prefix,
           QDRANT_MODE: "managed", QDRANT_URL: QDRANT_URL ?? `http://${QDRANT_HOST}:${QDRANT_PORT}`,
         },
       });
+      transport.stderr?.on("data", (chunk) => { notifications.push(String(chunk)); });
       await mcp.connect(transport);
+      await mcp.listTools();
       return mcp;
     }
     const first = await launch();
     try {
-      await vi.waitFor(() => expect(notifications.some((message) => message.includes(`Retained identity ${identity}`))).toBe(true), { timeout: 20_000, interval: 250 });
+      await vi.waitFor(() => expect(notifications.join("").includes(`Retained identity ${identity}`)).toBe(true), { timeout: 20_000, interval: 250 });
       expect(await exists(identity)).toBe(true);
+    } catch (error: unknown) {
+      throw new Error(`MCP initial cleanup diagnostics: ${notifications.join("\n")}`, { cause: error });
     } finally { await first.close(); }
     git(fixture.root, "worktree", "remove", checkout);
     const second = await launch();
     try {
       await vi.waitFor(async () => {
         expect(await exists(identity)).toBe(false);
-        expect(notifications.some((message) => message.includes(`Removed all inventoried resources for identity: ${identity}`))).toBe(true);
-      }, { timeout: 20_000, interval: 250 });
+        expect(notifications.join("").includes(`Removed all inventoried resources for identity: ${identity}`)).toBe(true);
+      }, { timeout: 20_000, interval: 250 }).catch((error: unknown) => {
+        throw new Error(`MCP cleanup did not complete: ${notifications.join("\n")}`, { cause: error });
+      });
     } finally { await second.close(); }
     for (const operation of ["prune", ...WRITER_OPERATIONS]) expect(await isProjectIdentityLocked(identity, operation)).toBe(false);
   });

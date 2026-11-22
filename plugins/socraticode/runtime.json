@@ -1,0 +1,20 @@
+{
+  "version": "1.16.1-local.9",
+  "port": 16335,
+  "env": {
+    "EMBEDDING_PROVIDER": "ollama",
+    "OLLAMA_MODE": "docker",
+    "EMBEDDING_MODEL": "hf.co/jinaai/jina-embeddings-v5-text-nano-retrieval:F16",
+    "EMBEDDING_DIMENSIONS": "768",
+    "EMBEDDING_CONTEXT_LENGTH": "2048",
+    "EMBEDDING_QUERY_PREFIX": "Query: ",
+    "EMBEDDING_DOCUMENT_PREFIX": "Document: ",
+    "EMBEDDING_BATCH_SIZE": "8",
+    "OLLAMA_MAX_CONNECTIONS": "1",
+    "SOCRATICODE_OLLAMA_GPUS": "all",
+    "SOCRATICODE_CUDA_CACHE_PATH": ".cache/cuda-cache",
+    "SOCRATICODE_AUTO_RESUME": "off",
+    "SOCRATICODE_RUNTIME_DIR": ".cache/runtime",
+    "SOCRATICODE_IDLE_STOP_TIMEOUT_MS": "600000"
+  }
+}

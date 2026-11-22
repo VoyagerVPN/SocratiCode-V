@@ -3,8 +3,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { glob } from "glob";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createIgnoreFilter, isEnvironmentMarker, shouldIgnore } from "../../src/services/ignore.js";
+import { createGlobIgnore, createIgnoreFilter, isEnvironmentMarker, shouldIgnore } from "../../src/services/ignore.js";
 import { createFixtureProject, type FixtureProject } from "../helpers/fixtures.js";
 
 describe("ignore", () => {
@@ -27,6 +28,119 @@ describe("ignore", () => {
   });
 
   describe("createIgnoreFilter", () => {
+    it("prunes dependency and cache descendants before glob visits them", async () => {
+      fixture = createFixtureProject("ignore-glob-pruning");
+      for (const directory of ["node_modules/installed/deep", ".cache/generated/deep", ".temp/session/deep", "packages/app/src"]) {
+        fs.mkdirSync(path.join(fixture.root, directory), { recursive: true });
+        fs.writeFileSync(path.join(fixture.root, directory, "main.ts"), "export const value = 1;");
+      }
+      const filter = createIgnoreFilter(fixture.root);
+      const pruning = createGlobIgnore(filter, fixture.root);
+      const fixtureRoot = fixture.root;
+      const visited: string[] = [];
+      const files = await glob("**/*", {
+        cwd: fixture.root, nodir: true, dot: true,
+        ignore: { childrenIgnored: (entry) => {
+          visited.push(path.relative(fixtureRoot, entry.fullpath()).split(path.sep).join("/"));
+          return pruning.childrenIgnored?.(entry) ?? false;
+        } },
+      });
+      const normalizedFiles = files.map((file) => file.split(path.sep).join("/"));
+      expect(normalizedFiles).toContain("packages/app/src/main.ts");
+      expect(normalizedFiles.some((file) => /^(node_modules|\.cache|\.temp)\//.test(file))).toBe(false);
+      expect(visited.some((directory) => /^(node_modules|\.cache|\.temp)\//.test(directory))).toBe(false);
+    });
+
+    it("lets glob visit an explicitly re-included cache fixture", async () => {
+      fixture = createFixtureProject("ignore-glob-override");
+      fs.mkdirSync(path.join(fixture.root, ".cache", "fixture"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, ".cache", "fixture", "main.ts"), "export const value = 1;");
+      fs.writeFileSync(path.join(fixture.root, ".socraticodeignore"), "!.cache/\n!.cache/fixture/\n");
+      const filter = createIgnoreFilter(fixture.root);
+      const files = await glob("**/*", { cwd: fixture.root, nodir: true, dot: true,
+        ignore: createGlobIgnore(filter, fixture.root) });
+      expect(files.map((file) => file.split(path.sep).join("/"))).toContain(".cache/fixture/main.ts");
+    });
+
+    it("keeps an intentional project root inside a parent cache", async () => {
+      fixture = createFixtureProject("ignore-glob-cache-root");
+      const root = path.join(fixture.root, ".cache", "references", "library");
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(path.join(root, "main.ts"), "export const value = 1;");
+      const filter = createIgnoreFilter(root);
+      const files = await glob("**/*", { cwd: root, nodir: true, dot: true,
+        ignore: createGlobIgnore(filter, root) });
+      expect(files).toEqual(["main.ts"]);
+    });
+
+    it("preserves an explicitly re-included descendant of a discovered environment", async () => {
+      fixture = createFixtureProject("ignore-glob-environment");
+      fs.mkdirSync(path.join(fixture.root, "fixtures", "python-env", "lib"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, "fixtures", "python-env", "pyvenv.cfg"), "home = python");
+      fs.writeFileSync(path.join(fixture.root, "fixtures", "python-env", "lib", "main.py"), "value = 1");
+      fs.writeFileSync(path.join(fixture.root, ".socraticodeignore"), "!fixtures/python-env/lib/**\n");
+      const filter = createIgnoreFilter(fixture.root);
+      const files = await glob("**/*", { cwd: fixture.root, nodir: true,
+        ignore: createGlobIgnore(filter, fixture.root) });
+      expect(files.filter((file) => !shouldIgnore(filter, file))
+        .map((file) => file.split(path.sep).join("/"))).toContain("fixtures/python-env/lib/main.py");
+    });
+
+    it.each([
+      ".tgrep/index/data.json",
+      ".temp/session/data.json",
+      ".pnpm-store/package/index.js",
+      ".yarn/cache/package/index.js",
+      "tools/site-packages/package/module.py",
+      ".pytest_cache/results.json",
+      "public/lib/pdf.worker.min.mjs",
+      "public/lib/bundle.min.cjs",
+    ])("excludes standard cache or installed dependency %s without project rules", (relativePath) => {
+      fixture = createFixtureProject("ignore-local-defaults");
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, relativePath)).toBe(true);
+      expect(shouldIgnore(ig, "packages/app/src/main.ts")).toBe(false);
+      expect(shouldIgnore(ig, "lib/domain.py")).toBe(false);
+    });
+
+    it("does not read nested ignore rules inside an excluded cache", () => {
+      fixture = createFixtureProject("ignore-cache-walk");
+      fs.mkdirSync(path.join(fixture.root, ".cache", "dependency"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, ".cache", "dependency", ".gitignore"), "generated.ts\n");
+      const ig = createIgnoreFilter(fixture.root);
+      expect(ig.sources.some((source) => source.path.startsWith(".cache/"))).toBe(false);
+    });
+
+    it("reads an explicitly re-included cache fixture and keeps its nested rules", () => {
+      fixture = createFixtureProject("ignore-cache-override");
+      fs.mkdirSync(path.join(fixture.root, ".cache", "fixture"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, ".cache", "fixture", ".gitignore"), "generated.ts\n");
+      fs.writeFileSync(path.join(fixture.root, ".socraticodeignore"), "!.cache/\n!.cache/fixture/\n");
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, ".cache/fixture/main.ts")).toBe(false);
+      expect(shouldIgnore(ig, ".cache/fixture/generated.ts")).toBe(true);
+    });
+
+    it("excludes Unity tooling directories only for an identified Unity project", () => {
+      fixture = createFixtureProject("ignore-unity-defaults");
+      fs.mkdirSync(path.join(fixture.root, "Packages"), { recursive: true });
+      fs.mkdirSync(path.join(fixture.root, "ProjectSettings"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, "Packages", "manifest.json"), "{}");
+      fs.writeFileSync(path.join(fixture.root, "ProjectSettings", "ProjectVersion.txt"), "m_EditorVersion: 6000.0.0f1");
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "Library/PackageCache/package/main.cs")).toBe(true);
+      expect(shouldIgnore(ig, "Temp/generated.cs")).toBe(true);
+      expect(shouldIgnore(ig, "Packages/local-package/main.cs")).toBe(false);
+      expect(shouldIgnore(ig, "Assets/main.cs")).toBe(false);
+    });
+
+    it("keeps ordinary source directories named Library and Temp", () => {
+      fixture = createFixtureProject("ignore-source-library");
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "Library/main.cs")).toBe(false);
+      expect(shouldIgnore(ig, "Temp/main.cs")).toBe(false);
+    });
+
     it("returns an ignore filter object", () => {
       fixture = createFixtureProject("ignore-test");
       const ig = createIgnoreFilter(fixture.root);
@@ -220,7 +334,7 @@ describe("ignore", () => {
       ["!", "!env", "env"],
       ["#", "#env", "env"],
       ["\\", "env\\x", "envx"],
-    ])("matches an environment directory whose name carries %s literally", (_, name, neighbour) => {
+    ].filter(([character]) => process.platform !== "win32" || (character !== "?" && character !== "*")))("matches an environment directory whose name carries %s literally", (_, name, neighbour) => {
       fixture = createFixtureProject("ignore-venv-metacharacter");
       fs.mkdirSync(path.join(fixture.root, "sub", name, "lib"), { recursive: true });
       fs.writeFileSync(

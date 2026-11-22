@@ -21,6 +21,7 @@ vi.mock("../../src/services/logger.js", () => ({
 // ── Imports (after mocks are registered) ─────────────────────────────────
 
 import { execFile } from "node:child_process";
+import path from "node:path";
 import {
   ensureOllamaContainerReady,
   ensureQdrantReady,
@@ -33,6 +34,7 @@ import {
   pullQdrantImage,
   resetOllamaContainerReadinessCache,
   resetQdrantReadinessCache,
+  startOllama,
   startQdrant,
 } from "../../src/services/docker.js";
 
@@ -57,6 +59,37 @@ const rejectFailed = (stderr = "some docker error") =>
   mockExecFile.mockRejectedValueOnce(
     Object.assign(new Error("exit 1"), { stderr }),
   );
+
+describe("managed Ollama GPU creation", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+  it("requests GPU access when the local profile requires it", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("SOCRATICODE_OLLAMA_GPUS", "all");
+    resolveOk("");
+    resolveOk("");
+    resolveOk("created-container");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}"));
+    await startOllama();
+    const creating = mockExecFile.mock.calls.find((call) => call[1][0] === "run");
+    expect(creating?.[1]).toEqual(expect.arrayContaining(["--gpus", "all"]));
+  });
+
+  it("persists the configured CUDA cache outside a recreated container", async () => {
+    vi.clearAllMocks();
+    const cachePath = path.resolve(".cache/docker-gpu-test");
+    vi.stubEnv("SOCRATICODE_OLLAMA_GPUS", "all");
+    vi.stubEnv("SOCRATICODE_CUDA_CACHE_PATH", cachePath);
+    resolveOk(""); resolveOk(""); resolveOk("created-container");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}"));
+    await startOllama();
+    const creating = mockExecFile.mock.calls.find((call) => call[1][0] === "run");
+    expect(creating?.[1]).toEqual(expect.arrayContaining([
+      "--mount", `type=bind,source=${cachePath},target=/cuda-cache`,
+      "CUDA_CACHE_PATH=/cuda-cache",
+    ]));
+  });
+});
 
 // ── isDockerAvailable ─────────────────────────────────────────────────────
 
@@ -233,74 +266,83 @@ describe("startQdrant", () => {
   });
 
   it("skips creation and returns when Qdrant is already running", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ready"));
     // isQdrantRunning returns true
     resolveOk("socraticode-qdrant");
     // No further docker calls should be needed
     await startQdrant();
     // execFile called exactly once (for isQdrantRunning)
     expect(mockExecFile).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:16333/readyz", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    fetchMock.mockRestore();
   });
 });
 
 // ── ensureQdrantReady (managed mode) — readiness cache ───────────────────
 
-describe("ensureQdrantReady managed mode cache", () => {
+describe("ensureQdrantReady managed mode readiness", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    mockExecFile.mockReset();
     resetQdrantReadinessCache();
   });
 
-  it("fast-paths on the second call without invoking docker", async () => {
-    // First call: docker info + images + ps all succeed; skip actual start by
-    // reporting image present and container already running.
-    resolveOk(); // docker info → available
-    resolveOk("qdrant/qdrant:v1.17.0"); // images → present
-    resolveOk("socraticode-qdrant"); // ps → running
-
-    const first = await ensureQdrantReady();
-    expect(first).toMatchObject({ started: false, pulled: false });
-
-    const callsAfterFirst = mockExecFile.mock.calls.length;
-
-    // Second call should be served from cache — no new docker calls
-    const second = await ensureQdrantReady();
-    expect(second).toMatchObject({ started: false, pulled: false });
-    expect(mockExecFile).toHaveBeenCalledTimes(callsAfterFirst);
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
-  it("throws when Docker is not available in managed mode", async () => {
-    rejectFailed("Cannot connect to daemon"); // docker info fails
+  it("waits for HTTP readiness when an already running container is still loading", async () => {
+    vi.useFakeTimers();
+    resolveOk();
+    resolveOk("qdrant/qdrant:v1.17.0");
+    resolveOk("socraticode-qdrant");
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("loading", { status: 503 }))
+      .mockResolvedValueOnce(new Response("loading", { status: 503 }))
+      .mockResolvedValueOnce(new Response("ready"));
+    let finished = false;
+    const pending = ensureQdrantReady().then((result) => {
+      finished = true;
+      return result;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(finished).toBe(false);
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:16333/readyz", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(pending).resolves.toEqual({ started: false, pulled: false });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses fresh HTTP readiness without Docker for consecutive healthy calls", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("ready"));
+    await expect(ensureQdrantReady()).resolves.toEqual({ started: false, pulled: false });
+    await expect(ensureQdrantReady()).resolves.toEqual({ started: false, pulled: false });
+    expect(mockExecFile).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws when both HTTP and Docker are unavailable", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connection refused"));
+    rejectFailed("Cannot connect to daemon");
     await expect(ensureQdrantReady()).rejects.toThrow("Docker is not available");
   });
+
 });
 
 // ── resetOllamaContainerReadinessCache ────────────────────────────────────
 
 describe("resetOllamaContainerReadinessCache", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    resetOllamaContainerReadinessCache();
-  });
-
-  it("forces a re-check after reset", async () => {
-    // Prime the cache: docker info + images + ps all succeed
-    resolveOk(); // docker info
-    resolveOk("ollama/ollama:latest"); // images
-    resolveOk("socraticode-ollama"); // ps
-
-    const first = await ensureOllamaContainerReady();
-    expect(first).toMatchObject({ started: false, pulled: false });
-
-    const callsAfterFirst = mockExecFile.mock.calls.length;
-
-    // Reset: next call must re-check
-    resetOllamaContainerReadinessCache();
-    resolveOk(); // docker info again
-    resolveOk("ollama/ollama:latest"); // images again
-    resolveOk("socraticode-ollama"); // ps again
-
+  beforeEach(() => { mockExecFile.mockReset(); resetOllamaContainerReadinessCache(); });
+  afterEach(() => vi.restoreAllMocks());
+  it("checks healthy HTTP again after reset without Docker CLI", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("ready"));
     await ensureOllamaContainerReady();
-    expect(mockExecFile.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+    await ensureOllamaContainerReady();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    resetOllamaContainerReadinessCache();
+    await ensureOllamaContainerReady();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(mockExecFile).not.toHaveBeenCalled();
   });
 });
 
@@ -439,7 +481,7 @@ describe("ensureQdrantReady external mode", () => {
 
     expect(fetchSpy).toHaveBeenCalledWith(
       "http://local-qdrant:6333/healthz",
-      undefined,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
 
     fetchSpy.mockRestore();

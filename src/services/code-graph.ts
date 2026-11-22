@@ -1,3 +1,4 @@
+import { runWithIdleActivity } from "./idle-lifecycle.js";
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
@@ -18,6 +19,7 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessDetection } from "./extensionless.js";
 import type { GitRefreshTarget } from "./git-state.js";
 import { loadPathAliases } from "./graph-aliases.js";
+import { isInputConfig } from "./graph-cpp.js";
 import { extractImports } from "./graph-imports.js";
 import {
   createGraphInputRecorder,
@@ -30,8 +32,10 @@ import {
   graphCapabilitiesHash,
   scanDirectory,
 } from "./graph-inputs.js";
+import { createJsImportClassifier } from "./graph-js-provenance.js";
 import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGodotProjectIndexes, buildGodotUidIndexes, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, type ClassNameIndex, findGodotProjectRootForProject, findGodotRootForFile, type GodotUidIndex, parseGodotAutoloads, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import {
+  computeSymbolCoverage,
   computeUnresolvedPct,
   type GodotSymbolResolutionContext,
   resolveCallSites,
@@ -41,6 +45,8 @@ import {
   type RustUseBinding,
   rawCallsToUnresolvedEdges,
 } from "./graph-symbols.js";
+import { createTypeScriptResolver } from "./graph-typescript.js";
+import { connectUnrealSites, type UnrealSite } from "./graph-unreal-events.js";
 
 import { createIgnoreFilter } from "./ignore.js";
 import { logger } from "./logger.js";
@@ -323,6 +329,13 @@ export async function rebuildGraph(
   projectPath: string,
   optsOrExtras?: Set<string> | RebuildGraphOptions,
 ): Promise<CodeGraph> {
+  return runWithIdleActivity(() => rebuildGraphImpl(projectPath, optsOrExtras));
+}
+
+async function rebuildGraphImpl(
+  projectPath: string,
+  optsOrExtras?: Set<string> | RebuildGraphOptions,
+): Promise<CodeGraph> {
   const resolved = path.resolve(projectPath);
   const opts: RebuildGraphOptions =
     optsOrExtras instanceof Set ? { extraExtensions: optsOrExtras } : (optsOrExtras ?? {});
@@ -459,6 +472,7 @@ async function doRebuildGraph(
           built.godotContext,
         );
 
+        connectUnrealSites(built.unrealSites, built.symbolsByFile, built.outgoingCallsByFile);
         progress.phase = "persisting symbols";
         await persistSymbolGraph(projectId, resolvedPath, built.symbolsByFile, built.outgoingCallsByFile);
       } catch (err) {
@@ -633,6 +647,7 @@ async function persistSymbolGraph(
         edgeCount: totalEdges,
         fileCount: symbolsByFile.size,
         unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
+        coverage: computeSymbolCoverage(outgoingCallsByFile),
         builtAt: Date.now(),
         schemaVersion: 2,
         generation: newGeneration,
@@ -711,6 +726,7 @@ export async function getGraphStatus(projectPath: string): Promise<{
   /** Import specifiers captured across all files, resolved or not. Absent on
    * graphs persisted before this field was recorded. */
   importCount?: number;
+  importCoverage?: import("../types.js").ImportCoverage;
   /** SocratiCode version that built this graph, which is not necessarily the
    * one serving it. Absent on graphs persisted before this field was
    * recorded. */
@@ -721,6 +737,7 @@ export async function getGraphStatus(projectPath: string): Promise<{
     symbolCount: number;
     edgeCount: number;
     unresolvedEdgePct: number;
+    coverage?: SymbolGraphMeta["coverage"];
     builtAt: number;
   };
 } | null> {
@@ -736,6 +753,7 @@ export async function getGraphStatus(projectPath: string): Promise<{
     symbolCount: number;
     edgeCount: number;
     unresolvedEdgePct: number;
+    coverage?: SymbolGraphMeta["coverage"];
     builtAt: number;
   } | undefined;
   try {
@@ -747,6 +765,7 @@ export async function getGraphStatus(projectPath: string): Promise<{
         symbolCount: sm.symbolCount,
         edgeCount: sm.edgeCount,
         unresolvedEdgePct: sm.unresolvedEdgePct,
+        coverage: sm.coverage,
         builtAt: sm.builtAt,
       };
     }
@@ -758,6 +777,7 @@ export async function getGraphStatus(projectPath: string): Promise<{
     nodeCount: meta.nodeCount,
     edgeCount: meta.edgeCount,
     importCount: meta.importCount,
+    importCoverage: meta.importCoverage,
     builtByVersion: meta.builtByVersion,
     cached: graphCache.get(resolved)?.projectId === projectId,
     symbol,
@@ -836,6 +856,7 @@ function preflightGdscriptAddon(gdscriptPkgPath: string): string | null {
   try {
     const stdout = execFileSync(process.execPath, [preflightScript, gdscriptPkgPath], {
       timeout: 10_000,
+      windowsHide: true,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
@@ -1137,7 +1158,7 @@ export async function getGraphableFiles(
         // resolution. They are not graph nodes themselves, but they must
         // be in the file set so buildGodotUidIndexes can read them.
         const isGodotUid = ext === ".uid";
-        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext) || isGodotResource || isGodotUid) {
+        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext) || isGodotResource || isGodotUid || isInputConfig(relPath)) {
           files.push(relPath);
         } else if (ext === "" && (includeDotFiles || !entry.name.startsWith("."))) {
           // Extensionless: admit only when detection yields a grammar-bearing
@@ -1185,6 +1206,7 @@ export async function buildCodeGraph(
   extraExtensions?: Set<string>,
   progress?: GraphBuildProgress,
 ): Promise<CodeGraph & {
+  unrealSites: UnrealSite[];
   symbolsByFile: Map<string, SymbolNode[]>;
   outgoingCallsByFile: Map<string, SymbolEdge[]>;
   autoloadTable?: Map<string, string>;
@@ -1227,6 +1249,8 @@ export async function buildCodeGraph(
   const aliases = await loadPathAliases(resolvedPath, recorder);
   const { files, detectedExts } = await getGraphableFiles(resolvedPath, extraExtensions, recorder);
   const fileSet = new Set(files);
+  const hasJsTs = files.some((file) => ["javascript", "typescript", "svelte", "vue"].includes(getLanguageFromExtension(path.extname(file))));
+  const tsContextFor = hasJsTs ? createTypeScriptResolver(resolvedPath, fileSet, recorder) : undefined;
   if (files.some((file) => isElixirTemplateExtension(path.extname(file)))) {
     await ensureElixirTemplateParsers();
   }
@@ -1295,8 +1319,11 @@ export async function buildCodeGraph(
 
   logger.info("Building code graph", { projectPath: resolvedPath, fileCount: files.length });
 
+  const classifyJsImport = createJsImportClassifier(resolvedPath, aliases, recorder, files.filter((file) =>
+    ["typescript", "javascript", "tsx", "jsx", "svelte", "vue"].includes(getLanguageFromExtension(path.extname(file).toLowerCase()))));
   const nodesMap = new Map<string, CodeGraphNode>();
   const edges: CodeGraphEdge[] = [];
+  const unrealSites: UnrealSite[] = [];
   const symbolsByFile = new Map<string, SymbolNode[]>();
   const outgoingCallsByFile = new Map<string, SymbolEdge[]>();
   const inferredTypesByFile = new Map<string, Map<string, Array<{ type: string; startLine: number; endLine: number }>>>();
@@ -1497,7 +1524,7 @@ export async function buildCodeGraph(
       if (progress) progress.filesProcessed++;
       continue;
     }
-    if (!lang && !isElixirTemplate && !isGodotResource) {
+    if (!lang && !isElixirTemplate && !isGodotResource && !isInputConfig(relPath)) {
       const absolutePath = path.join(resolvedPath, relPath);
       // A leaf node is made from its path alone — nothing here reads it — so
       // only its presence is recorded. Its content reaching the graph would
@@ -1583,13 +1610,14 @@ export async function buildCodeGraph(
     // as plaintext.
     node.language = language;
 
-    const extractionLang = lang ?? (isGodotResource ? "godot-resource" : "elixir-template");
-    const importInfos = extractImports(source, extractionLang, ext);
+    const extractionLang = lang ?? (isInputConfig(relPath) ? "unreal-input" : isGodotResource ? "godot-resource" : "elixir-template");
+    const importInfos = extractionLang === "unreal-input" ? [] : extractImports(source, extractionLang, ext);
 
     // Extract symbols & raw call sites in the same pass
     try {
       const extracted = extractSymbolsAndCalls(source, extractionLang, ext, relPath);
       symbolsByFile.set(relPath, extracted.symbols);
+      if (extracted.unrealSites) unrealSites.push(...extracted.unrealSites);
       const edges = rawCallsToUnresolvedEdges(extracted.rawCalls);
       outgoingCallsByFile.set(relPath, edges);
       // One edge per raw call, in order, so the call at `i` is the edge at `i`.
@@ -1644,6 +1672,8 @@ export async function buildCodeGraph(
     // workspace has one — an edge into an unrelated crate. Where the
     // declaration does not move anything, the value is the name itself.
     const declaredMods = new Map<string, string>();
+    const tsContext = ["javascript", "typescript", "svelte", "vue"].includes(language)
+      ? tsContextFor?.(absolutePath) : undefined;
     for (const imp of importInfos) {
       if (imp.declaredName) declaredMods.set(imp.declaredName, imp.moduleSpecifier);
     }
@@ -1690,8 +1720,18 @@ export async function buildCodeGraph(
       // unaffected: there the path is absolute from the crate root and never
       // consulted the map to begin with.
       const scopedMods = imp.fromInlineBlock ? EMPTY_DECLARED_MODS : declaredMods;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true, fileClassNameIndex, fileGodotRoot, fileUidIndex, imp.fallbackSpecifier, imp.godotImportKind);
+      const jsBareImport = tsContext && !imp.isCssImport && !imp.moduleSpecifier.startsWith(".");
+      const resolved = jsBareImport ? tsContext.resolve(imp)
+        : resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, tsContext?.aliases ?? aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true, fileClassNameIndex, fileGodotRoot, fileUidIndex, imp.fallbackSpecifier, imp.godotImportKind);
+      if (["typescript", "javascript", "tsx", "jsx", "svelte", "vue"].includes(language)) {
+        node.importScopes ??= {};
+        node.importScopes[imp.moduleSpecifier] = classifyJsImport(relPath, imp.moduleSpecifier, resolved);
+      }
       if (resolved) {
+        node.importTargets ??= {};
+        node.importScopes ??= {};
+        node.importTargets[imp.moduleSpecifier] = resolved;
+        node.importScopes[imp.moduleSpecifier] = "project";
         node.dependencies.push(resolved);
 
         // Ensure target node exists
@@ -1768,6 +1808,7 @@ export async function buildCodeGraph(
     nodes: Array.from(nodesMap.values()),
     edges,
     symbolsByFile,
+    unrealSites,
     outgoingCallsByFile,
     autoloadTable,
     resToRepoPathMap,

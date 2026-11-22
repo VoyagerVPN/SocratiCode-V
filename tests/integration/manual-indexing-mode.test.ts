@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
 import fs from "node:fs";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { collectionName, projectIdFromPath } from "../../src/config.js";
 import {
@@ -69,7 +70,7 @@ async function waitForIndexedFile(
 ): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if ((await loadProjectHashes(collection))?.has(relativePath)) return;
+    if ((await loadProjectHashes(collection))?.has(relativePath.split("/").join(path.sep))) return;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw new Error(`${relativePath} was not indexed within ${timeoutMs}ms`);
@@ -153,7 +154,7 @@ describe.skipIf(!dockerAvailable)(
 
       // Tool use and the watch debounce window must not make a snapshot write.
       await new Promise((resolve) => setTimeout(resolve, 3_000));
-      expect((await loadProjectHashes(collection))?.has(unindexedPath)).toBe(false);
+      expect((await loadProjectHashes(collection))?.has(unindexedPath.split("/").join(path.sep))).toBe(false);
       expect(isWatching(fixture.root)).toBe(false);
 
       const resumeDisabledPath = "src/resume-disabled.ts";
@@ -164,7 +165,7 @@ describe.skipIf(!dockerAvailable)(
       );
       await autoResumeIndexedProjects(fixture.root);
       await new Promise((resolve) => setTimeout(resolve, 3_000));
-      expect((await loadProjectHashes(collection))?.has(resumeDisabledPath)).toBe(false);
+      expect((await loadProjectHashes(collection))?.has(resumeDisabledPath.split("/").join(path.sep))).toBe(false);
       expect(isWatching(fixture.root)).toBe(false);
 
       process.env.SOCRATICODE_WATCHER = "manual";
@@ -173,8 +174,8 @@ describe.skipIf(!dockerAvailable)(
       });
       expect(updateResult).toContain("Added: 2");
       const hashesAfterUpdate = await loadProjectHashes(collection);
-      expect(hashesAfterUpdate?.has(unindexedPath)).toBe(true);
-      expect(hashesAfterUpdate?.has(resumeDisabledPath)).toBe(true);
+      expect(hashesAfterUpdate?.has(unindexedPath.split("/").join(path.sep))).toBe(true);
+      expect(hashesAfterUpdate?.has(resumeDisabledPath.split("/").join(path.sep))).toBe(true);
       expect(isWatching(fixture.root)).toBe(false);
 
       const existingGraph = await handleGraphTool("codebase_graph_stats", {

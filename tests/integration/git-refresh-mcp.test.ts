@@ -5,8 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { collectionName, projectIdFromPath } from "../../src/config.js";
 import { OLLAMA_HOST, QDRANT_API_KEY, QDRANT_HOST, QDRANT_PORT, QDRANT_URL } from "../../src/constants.js";
@@ -34,7 +34,7 @@ describe.skipIf(!isDockerAvailable())("Git refresh across two real MCP processes
     const entrypoint = fileURLToPath(new URL("../../dist/index.js", import.meta.url));
     if (!fs.existsSync(entrypoint)) throw new Error("Run npm run build before the MCP integration test");
     for (let i = 0; i < 2; i++) {
-      const client = new Client({ name: "git-refresh-fixture", version: "1.0.0" });
+      const client = new Client({ name: "git-refresh-fixture", version: "1.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
       clients.push(client);
       const transport = new StdioClientTransport({
         command: process.execPath,

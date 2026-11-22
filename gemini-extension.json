@@ -1,6 +1,6 @@
 {
   "name": "socraticode",
-  "version": "1.16.0",
+  "version": "1.16.1-local.9",
   "contextFileName": "GEMINI.md",
   "mcpServers": {
     "socraticode": {

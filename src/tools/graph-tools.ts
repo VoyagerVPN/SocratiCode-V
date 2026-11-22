@@ -2,26 +2,28 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
 import { projectIdFromPath } from "../config.js";
-import { getWatcherMode, mergeExtraExtensions, SOCRATICODE_VERSION } from "../constants.js";
-import { awaitGraphBuild, describeGraphBuilder, describeUnresolvedSymbolEdges, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getAstGrepLang, getDynamicLanguageStatus, getExistingGraph, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
+import { getWatcherMode, mergeExtraExtensions, SOCRATICODE_VERSION, toForwardSlash } from "../constants.js";
+import { awaitGraphBuild, describeGraphBuilder, describeUnresolvedSymbolEdges, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getAstGrepLang, getDynamicLanguageStatus, getExistingGraph, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, invalidateGraphCache, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
 import { withGitRefreshNotice } from "../services/git-refresh.js";
 import { detectEntryPoints } from "../services/graph-entrypoints.js";
 import {
   type FlowNode,
   getCallFlow,
   getImpactRadius,
-  getSymbolContext,
-  listSymbols,
+  getSymbolContextResult,
+  listSymbolPage,
   looksLikeFilePath,
 } from "../services/graph-impact.js";
 import { openInBrowser, writeInteractiveGraphFile } from "../services/graph-visualize-browser.js";
 import { buildInteractiveGraphHtml } from "../services/graph-visualize-html.js";
 import { logger } from "../services/logger.js";
+import { createResultPage, fitResultPage, PageCursorError, type PageEntry, type PageToolResponse, pageFailure, pageFingerprint, type RawPageToolResponse, readPageOffset } from "../services/result-pages.js";
 import {
   dropSymbolGraphCacheGeneration,
   getSymbolGraphCache,
 } from "../services/symbol-graph-cache.js";
 import {
+  loadSymbolGraphMeta,
   StorageReadError,
   SymbolGraphGenerationChangedError,
 } from "../services/symbol-graph-store.js";
@@ -82,6 +84,10 @@ export async function handleGraphTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<string> {
+  if (name === "codebase_symbols" || name === "codebase_graph_query") {
+    const page = await handleGraphListTool(name, args);
+    return formatGraphListText(page, args);
+  }
   if (name === "codebase_graph_build" || name === "codebase_graph_remove") return handleGraphResult(name, args);
   const projectPath = (args.projectPath as string) || process.cwd();
   return withGitRefreshNotice(projectPath, () => handleGraphResult(name, args));
@@ -180,35 +186,6 @@ async function dispatchGraphTool(
         "Call codebase_graph_status to check progress. Keep calling it periodically until the build completes.",
         "Once complete, you can use codebase_graph_query, codebase_graph_stats, etc. to explore the graph.",
       ].join("\n");
-    }
-
-    case "codebase_graph_query": {
-      const filePath = args.filePath as string;
-      const graph = await getGraphForRead(projectPath);
-      const deps = getFileDependencies(graph, filePath);
-
-      const lines = [`Dependencies for: ${filePath}\n`];
-
-      if (deps.imports.length === 0 && deps.importedBy.length === 0) {
-        lines.push("No dependency information found for this file.");
-        lines.push("Make sure codebase_graph_build has been run and the file path is relative.");
-      } else {
-        if (deps.imports.length > 0) {
-          lines.push(`Imports (${deps.imports.length}):`);
-          for (const imp of deps.imports) {
-            lines.push(`  → ${imp}`);
-          }
-        }
-
-        if (deps.importedBy.length > 0) {
-          lines.push(`\nImported by (${deps.importedBy.length}):`);
-          for (const dep of deps.importedBy) {
-            lines.push(`  ← ${dep}`);
-          }
-        }
-      }
-
-      return lines.join("\n");
     }
 
     case "codebase_graph_stats": {
@@ -413,6 +390,11 @@ async function dispatchGraphTool(
       // a DEGRADED status: a hard state would false-positive on legitimately
       // orphan-heavy projects.
       const renderImportResolutionBlock = (): string[] => {
+        const coverage = graphInfo.importCoverage;
+        if (coverage) return [
+          "Import targets: project " + coverage.projectResolved + " resolved / " + coverage.projectUnresolved + " unresolved; external " + coverage.external + "; runtime " + coverage.runtime + "; unknown " + coverage.unknown,
+          ...(coverage.projectUnresolved > 0 ? ["  Unresolved project imports may omit local dependencies. External/runtime imports are outside the project graph; unknown targets remain unclassified."] : []),
+        ];
         // Captured before the predicate rather than asserted after it: the
         // predicate already rejects an absent count, but TypeScript cannot
         // narrow through the call, and an assertion here would keep compiling
@@ -471,7 +453,7 @@ async function dispatchGraphTool(
         lines.push(`  Files: ${sm.fileCount}`);
         lines.push(`  Symbols: ${sm.symbolCount}`);
         lines.push(`  Call edges: ${sm.edgeCount}`);
-        lines.push(...describeUnresolvedSymbolEdges(sm.unresolvedEdgePct));
+        lines.push(...describeUnresolvedSymbolEdges(sm.unresolvedEdgePct, sm.coverage));
       }
 
       lines.push(...renderGrammarBlock());
@@ -483,8 +465,9 @@ async function dispatchGraphTool(
       const target = (args.target as string | undefined)?.trim() ?? "";
       const file = (args.file as string | undefined)?.trim();
       const symbolId = (args.symbolId as string | undefined)?.trim();
-      if (!target && !symbolId) return "Missing required argument: target or symbolId";
+      if (!target && !symbolId) throw new Error("Missing required argument: target or symbolId");
       const depth = typeof args.depth === "number" ? args.depth : 3;
+      const limit = typeof args.limit === "number" ? args.limit : undefined;
       const projectId = projectIdFromPath(projectPath);
       const cache = await getSymbolGraphCache(projectId);
       if (!cache) {
@@ -498,7 +481,7 @@ async function dispatchGraphTool(
         file,
         symbolId,
       ) || (cache.meta.schemaVersion ? cache.meta.schemaVersion < 2 : true);
-      const result = await getImpactRadius(cache, target || (symbolId as string), depth, { file, symbolId, isIncomplete });
+      const result = await getImpactRadius(cache, target || (symbolId as string), depth, { file, symbolId, isIncomplete, limit });
 
       if (result.status === "graph_upgrade_required") {
         return result.message ?? "The symbol graph requires an upgrade. Rebuild with codebase_graph_build.";
@@ -516,6 +499,9 @@ async function dispatchGraphTool(
         ];
         if (result.candidates && result.candidates.length > 0) {
           lines.push("");
+          if (limit !== undefined && (result.totalCandidates ?? 0) > limit) {
+            lines.push(showingLine(result.candidates.length, result.totalCandidates ?? 0, "candidates for", target), "");
+          }
           lines.push("Candidates:");
           for (const c of result.candidates) {
             lines.push(`  - [${c.kind}] ${c.qualifiedName} in ${c.file}:${c.line} (ID: ${c.id})`);
@@ -533,7 +519,7 @@ async function dispatchGraphTool(
         "",
       ];
       if (result.totalFiles === 0) {
-        lines.push("No callers or references found — nothing else depends on this.");
+        lines.push("No other files with resolved callers or references were found within this depth. Unresolved, dynamic or external dependencies may be absent.");
       } else {
         for (const [hop, files] of result.filesByDepth.entries()) {
           lines.push(`Hop ${hop} (${files.length} files):`);
@@ -599,8 +585,11 @@ async function dispatchGraphTool(
           return `No symbol named "${entrypoint}" found${fileHint ? ` in ${fileHint}` : ""}.`;
         }
         if (refs.length > 1) {
+          const limit = typeof args.limit === "number" ? args.limit : undefined;
+          const listed = limit === undefined ? refs : refs.slice(0, limit);
           const lines = [`Symbol "${entrypoint}" is ambiguous (${refs.length} matches). Pass \`file\` to disambiguate:`, ""];
-          for (const r of refs) lines.push(`  - ${r.file}`);
+          if (listed.length < refs.length) lines.push(showingLine(listed.length, refs.length, "candidates for", entrypoint), "");
+          for (const r of listed) lines.push(`  - ${r.file}`);
           return lines.join("\n");
         }
         const depth = typeof args.depth === "number" ? args.depth : 5;
@@ -624,11 +613,16 @@ async function dispatchGraphTool(
       if (!cache) {
         return "No symbol graph found. Run codebase_graph_build (or codebase_index) first.";
       }
-      const ctxs = await getSymbolContext(cache, symName, fileHint);
+      const limit = typeof args.limit === "number" ? args.limit : undefined;
+      const { contexts: ctxs, total, fileCount } = await getSymbolContextResult(cache, symName, fileHint, limit);
       if (ctxs.length === 0) {
         return `No symbol named "${symName}" found${fileHint ? ` in ${fileHint}` : ""}.`;
       }
       const lines: string[] = [];
+      if (limit !== undefined && total > limit) {
+        const narrow = fileCount > 1 ? (fileHint ? NARROW_BY_LONGER_FILE : NARROW_BY_FILE) : undefined;
+        lines.push(showingLine(ctxs.length, total, "definitions of", symName, narrow), "");
+      }
       for (const ctx of ctxs) {
         lines.push(`Symbol: ${ctx.symbol.qualifiedName} (${ctx.symbol.kind})`);
         lines.push(`Defined: ${ctx.symbol.file}:${ctx.symbol.line}–${ctx.symbol.endLine}  [${ctx.symbol.language}]`);
@@ -649,36 +643,17 @@ async function dispatchGraphTool(
       return lines.join("\n").replace(/---\n?$/, "").trimEnd();
     }
 
-    case "codebase_symbols": {
-      const file = (args.file as string | undefined)?.trim();
-      const query = (args.query as string | undefined)?.trim();
-      const limit = typeof args.limit === "number" ? args.limit : 200;
-      const projectId = projectIdFromPath(projectPath);
-      const cache = await getSymbolGraphCache(projectId);
-      if (!cache) {
-        return "No symbol graph found. Run codebase_graph_build (or codebase_index) first.";
-      }
-      const symbols = await listSymbols(cache, { file, query, limit });
-      if (symbols.length === 0) {
-        return file
-          ? `No symbols found in ${file}.`
-          : query
-            ? `No symbols matching "${query}".`
-            : "No symbols found.";
-      }
-      const lines = [
-        file ? `Symbols in ${file} (${symbols.length}):` : `Symbols matching "${query ?? "*"}" (${symbols.length}):`,
-        "",
-      ];
-      for (const s of symbols) {
-        lines.push(`  ${s.kind.padEnd(11)} ${s.qualifiedName.padEnd(40)} ${s.file}:${s.line}`);
-      }
-      return lines.join("\n");
-    }
-
     default:
       return `Unknown tool: ${name}`;
   }
+}
+
+const NARROW_BY_FILE = "Pass file to narrow to one file";
+const NARROW_BY_LONGER_FILE = "Pass a longer file path to narrow to one file";
+
+/** Format the notice that only `shown` of `total` matches are listed; `narrow`, when given, comes before the larger-limit advice. */
+function showingLine(shown: number, total: number, noun: string, name: string, narrow?: string): string {
+  return `Showing ${shown} of ${total} ${noun} "${name}". ${narrow ? `${narrow}, or pass` : "Pass"} a larger limit to see more.`;
 }
 
 /** Render a FlowNode subtree using ASCII tree characters. */
@@ -692,7 +667,8 @@ function renderFlowTree(
   const suffix = node.truncatedReason
     ? ` [truncated: ${node.truncatedReason}]`
     : "";
-  out.push(`${prefix}${branch}${node.symbolName} (${node.file}:${node.line})${suffix}`);
+  const rpc = node.unrealRpc ? ` [Unreal ${node.unrealRpc} RPC]` : "";
+  out.push(`${prefix}${branch}${node.symbolName}${rpc}${node.via ? ` [${node.via}]` : ""} (${node.file}:${node.line})${suffix}`);
   const childPrefix = prefix + (isLast ? "    " : "│   ");
   for (let i = 0; i < node.children.length; i++) {
     renderFlowTree(node.children[i], childPrefix, i === node.children.length - 1, out);
@@ -701,3 +677,104 @@ function renderFlowTree(
 
 // Mark deprecated import as used to satisfy lint when no other reference exists
 void looksLikeFilePath;
+
+/** Пагинация читается из сохранённых данных, cursor не зависит от MCP-сессии. */
+export async function handleGraphListTool(name: string, args: Record<string, unknown>): Promise<PageToolResponse> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { return await readGraphListPage(name, args); }
+    catch (error: unknown) {
+      if (!(error instanceof SymbolGraphGenerationChangedError)) throw error;
+      dropSymbolGraphCacheGeneration(error.projectId, error.generation);
+    }
+  }
+  return pageFailure("unavailable", "Symbol graph changed repeatedly. Retry the request.");
+}
+
+async function readGraphListPage(name: string, args: Record<string, unknown>): Promise<PageToolResponse> {
+  const projectPath = path.resolve(typeof args.projectPath === "string" ? args.projectPath : process.cwd());
+  const file = typeof args.file === "string" ? toForwardSlash(args.file.trim()) : undefined;
+  const query = typeof args.query === "string" ? args.query.trim().toLowerCase() : undefined;
+  const filePath = typeof args.filePath === "string" ? toForwardSlash(args.filePath) : undefined;
+  const key = pageFingerprint({ tool: name, projectPath, file, query, filePath });
+  const limit = typeof args.limit === "number" ? args.limit : 200;
+  try {
+    let response: RawPageToolResponse | undefined;
+    ensureWatcherStarted(projectPath);
+    const notice = await withGitRefreshNotice(projectPath, async () => {
+      if (name === "codebase_graph_query") {
+        // Продолжение проверяет новый сохранённый граф, а не старый cache другого клиента.
+        invalidateGraphCache(projectPath);
+        const graph = await getGraphForRead(projectPath);
+        if (!filePath || !graph.nodes.some((node) => toForwardSlash(node.relativePath) === filePath)) {
+          throw new Error("File not found in the indexed graph: " + filePath + ". Check the relative path and indexed file coverage.");
+        }
+        const deps = getFileDependencies(graph, filePath);
+        const entries: PageEntry[] = [
+          ...[...new Set(deps.imports.map(toForwardSlash))].sort().map((file) => ({ kind: "import" as const, file })),
+          ...[...new Set(deps.importedBy.map(toForwardSlash))].sort().map((file) => ({ kind: "dependent" as const, file })),
+        ];
+        const metadata = await getGraphStatus(projectPath);
+        const revision = pageFingerprint({ builtAt: metadata?.lastBuiltAt, entries });
+        const offset = readPageOffset(args.cursor, key, revision);
+        response = createResultPage("File dependencies", key, revision, entries.slice(offset, offset + limit), offset, entries.length);
+        if (!entries.length) response.text += "\nNo resolved imports or dependents in this graph snapshot. Unresolved or dynamic dependencies may be absent.";
+      } else if (name === "codebase_symbols") {
+        const projectId = projectIdFromPath(projectPath);
+        let cache = await getSymbolGraphCache(projectId);
+        const current = await loadSymbolGraphMeta(projectId);
+        if (!cache || !current) throw new Error("No symbol graph found. Run codebase_graph_build first.");
+        if (cache.meta.generation !== current.generation || cache.meta.builtAt !== current.builtAt) {
+          dropSymbolGraphCacheGeneration(projectId, cache.meta.generation);
+          cache = await getSymbolGraphCache(projectId);
+          if (!cache) throw new Error("No current symbol graph found.");
+        }
+        const revision = pageFingerprint({ generation: cache.meta.generation, builtAt: cache.meta.builtAt });
+        const offset = readPageOffset(args.cursor, key, revision);
+        const result = await listSymbolPage(cache, { file, query, offset, limit });
+        const entries: PageEntry[] = result.symbols.map((s) => ({
+          kind: "symbol", id: s.id, name: s.name, qualifiedName: s.qualifiedName,
+          symbolKind: s.kind, file: s.file, line: s.line, endLine: s.endLine,
+        }));
+        const failure = getLastGraphBuildCompleted(projectPath)?.symbolGraphError;
+        response = createResultPage("Symbols", key, revision, entries, offset, result.total, failure ? [failure] : []);
+      } else throw new Error("Unsupported list tool: " + name);
+      return "";
+    });
+    if (!response) throw new Error("Graph page was not produced.");
+    if (notice.trim()) {
+      response.structuredContent.partial = true;
+      response.structuredContent.warnings.push(notice.trim());
+      response.text += " Snapshot warning: see structuredContent.warnings.";
+    }
+    return fitResultPage(response, key, typeof args.maxChars === "number" ? args.maxChars : 12000, args);
+  } catch (error: unknown) {
+    if (error instanceof SymbolGraphGenerationChangedError) throw error;
+    const failure = error instanceof PageCursorError ? pageFailure(error.status, error.message)
+      : pageFailure("unavailable", error instanceof Error ? error.message : String(error));
+    return fitResultPage(failure, key, typeof args.maxChars === "number" ? args.maxChars : 12000, args);
+  }
+}
+
+/** Текстовый интерфейс внутренних потребителей; MCP передаёт записи структурированно. */
+function formatGraphListText(response: PageToolResponse, args: Record<string, unknown>): string {
+  const entries = response.structuredContent.entries ?? [];
+  if (!entries.length) return response.text;
+  const lines = [response.text];
+  const imports = entries.filter((entry) => entry.kind === "import");
+  const dependents = entries.filter((entry) => entry.kind === "dependent");
+  if (imports.length) {
+    lines.push("Imports (" + imports.length + "):");
+    for (const entry of imports) lines.push("  → " + entry.file);
+  }
+  if (dependents.length) {
+    lines.push("Imported by (" + dependents.length + "):");
+    for (const entry of dependents) lines.push("  ← " + entry.file);
+  }
+  if (entries.some((entry) => entry.kind === "symbol")) {
+    lines.push(typeof args.file === "string" ? "Symbols in " + args.file : "Symbols matching " + String(args.query ?? "*"));
+    for (const entry of entries) {
+      if (entry.kind === "symbol") lines.push(entry.symbolKind + " " + entry.qualifiedName + " " + entry.file + ":" + entry.line + " [" + entry.id + "]");
+    }
+  }
+  return lines.join("\n");
+}

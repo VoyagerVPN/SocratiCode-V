@@ -138,7 +138,10 @@ describe("reclamation holds the writer's lock before the writer asks", () => {
 
     const result = await updateProjectIndex(project);
 
-    expect(result).toEqual({ added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false });
+    expect(result).toEqual({
+      added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false,
+      skipped: "Another process is already indexing this project, skipping",
+    });
     expect(storeWrites).not.toHaveBeenCalled();
     expect(holdsIdentityLock(identity, "index")).toBe(true);
     await releaseIdentityLock(identity, "index");
@@ -182,7 +185,7 @@ describe("the writer holds its lock before reclamation asks", () => {
       // The update's own reads pass; the first read of the fallback is where the question is asked.
       if (!progress.some((message) => message.includes("performing full index"))) return null;
       inside = {
-        locksTaken: vi.mocked(lockfile.lock).mock.calls.length,
+        locksTaken: vi.mocked(lockfile.lock).mock.calls.filter(([file]) => path.basename(String(file)) === `${identity}-index`).length,
         held: holdsIdentityLock(identity, "index"),
         barrier: await acquireReclamationBarrier(identity),
       };

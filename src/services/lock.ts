@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -310,7 +310,7 @@ export async function terminateLockHolder(projectPath: string, operation: string
     if (process.platform === "win32") {
       // process.kill() with signals other than 0 is not supported cross-process on Windows.
       // taskkill /F is a force-kill (no graceful shutdown), but it's the only reliable option.
-      execSync(`taskkill /F /PID ${pid}`, { stdio: "ignore" });
+      execFileSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true, shell: false });
       logger.info("Sent taskkill to orphan lock-holder process (Windows)", { pid, projectPath, operation });
     } else {
       process.kill(pid, "SIGTERM");

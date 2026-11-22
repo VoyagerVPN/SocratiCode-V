@@ -27,9 +27,9 @@ export async function handleContextTool(
       // List all artifacts: from config + their index status
       const config = await loadConfig(resolvedPath);
 
-      if (!config?.artifacts?.length) {
+      if (args.help === true) {
         return [
-          `No context artifacts configured for: ${resolvedPath}`,
+          "Context artifact setup",
           "",
           "To add context artifacts, create a .socraticodecontextartifacts.json file in your project root:",
           "",
@@ -49,6 +49,9 @@ export async function handleContextTool(
         ].join("\n");
       }
 
+      if (!config?.artifacts?.length) return `No context artifacts configured for: ${resolvedPath}`;
+
+      await ensureQdrantReady();
       const projectId = projectIdFromPath(resolvedPath);
       const collection = contextCollectionName(projectId);
       const existingStates = await loadContextMetadata(collection);

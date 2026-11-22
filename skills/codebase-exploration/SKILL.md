@@ -48,7 +48,7 @@ A single `codebase_search` call returns ranked, deduplicated snippets from acros
 
 ### 4. Leverage context artifacts for non-code knowledge
 
-Projects can define a `.socraticodecontextartifacts.json` config to expose database schemas, API specs, infrastructure configs, architecture docs, and other project knowledge that lives outside source code.
+При настройке SocratiCode проверьте `.socraticodeignore` в корне проекта. Если файла ещё нет, создайте его с исключениями по фактическому дереву проекта. Как только при настройке или дальнейшей работе впервые встретится авторитетный документ, который пригодится снова, сразу создайте рядом `.socraticodecontextartifacts.json` и добавьте документ в массив `artifacts`. Укажите устойчивое `name`, путь относительно корня в `path` и в `description` — на какие вопросы документ отвечает. Одного источника достаточно. Если каталог уже есть, дополните его, сохранив прежние записи и исключив дубли по пути.
 
 - **`codebase_context`** — list available artifacts (names, descriptions, paths, index status)
 - **`codebase_context_search`** — semantic search across all artifacts (or filter with `artifactName`)
@@ -87,3 +87,9 @@ Run `codebase_context` early to see what's available. Use `codebase_context_sear
 | Quick overview of all tools | `codebase_about` |
 
 For full parameter details on every tool, see [references/tool-reference.md](references/tool-reference.md).
+
+### Перенесённые обновления upstream
+
+`limit` в `codebase_symbol` ограничивает число разрешаемых определений с одинаковым именем. В `codebase_impact` и `codebase_flow` он ограничивает список неоднозначных кандидатов, а не глубину или размер дерева вызовов. Положительное целое число; без параметра возвращаются все определения/кандидаты. Ответ сообщает полное число совпадений.
+
+`fileFilter` принимает один точный относительный путь из результата, без каталогов и glob; `languageFilter` принимает точное имя языка (`typescript`, `python`), без сокращений `ts` и `py`.

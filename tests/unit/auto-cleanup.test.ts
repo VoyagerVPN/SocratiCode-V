@@ -52,8 +52,11 @@ describe("automatic cleanup lifecycle and explicit local gate", () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     let complete!: (value: typeof empty) => void;
     mocks.inventory.mockReturnValueOnce(new Promise<typeof empty>((resolve) => { complete = resolve; }));
+    try {
     startAutomaticCleanup();
     startAutomaticCleanup();
+    // Реальный файловый ввод-вывод idle supervisor завершается по своим часам.
+    await vi.waitFor(() => expect(mocks.inventory).toHaveBeenCalledTimes(1));
     await vi.advanceTimersByTimeAsync(180_000);
     expect(mocks.inventory).toHaveBeenCalledTimes(1);
     let drained = false;
@@ -65,8 +68,13 @@ describe("automatic cleanup lifecycle and explicit local gate", () => {
     await vi.advanceTimersByTimeAsync(180_000);
     expect(mocks.inventory).toHaveBeenCalledTimes(1);
     startAutomaticCleanup();
+    await vi.waitFor(() => expect(mocks.inventory).toHaveBeenCalledTimes(2));
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(mocks.inventory).toHaveBeenCalledTimes(3);
+    await vi.waitFor(() => expect(mocks.inventory).toHaveBeenCalledTimes(3));
+    } finally {
+      // Даже при ошибке проверки незавершённый внешний запрос должен разблокировать shutdown.
+      complete(empty);
+    }
   });
 
   it("reports backend failure as incomplete cleanup rather than a successful empty inventory", async () => {

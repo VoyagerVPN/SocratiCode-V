@@ -9,6 +9,7 @@ import {
 } from "./embedding-config.js";
 import { getEmbeddingProvider } from "./embedding-provider.js";
 import { logger } from "./logger.js";
+import { searchStage } from "./startup-trace.js";
 
 // Number of texts to embed per provider request.
 // Configurable via env var EMBEDDING_BATCH_SIZE (positive integer); defaults to 32.
@@ -77,15 +78,18 @@ async function withRetry<T>(
 export async function generateEmbeddings(
   texts: string[],
   onBatchComplete?: (processed: number, total: number) => void,
+  shouldCancel?: () => boolean,
 ): Promise<number[][]> {
   if (texts.length === 0) return [];
 
   const provider = await getEmbeddingProvider();
+  await provider.ensureReady();
   const config = getEmbeddingConfig();
   const batchDelay = PROVIDER_BATCH_DELAY[config.embeddingProvider] ?? 0;
   const results: number[][] = [];
 
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    if (shouldCancel?.()) break;
     // Inter-batch delay to respect provider rate limits (skip first batch)
     if (batchDelay > 0 && i > 0) {
       logger.info(`Rate-limit pause: waiting ${batchDelay / 1000}s before next batch`);
@@ -114,10 +118,14 @@ export async function generateQueryEmbedding(
   effectiveQueryPrefix: string = queryPrefix(),
 ): Promise<number[]> {
   const provider = await getEmbeddingProvider();
-  return withRetry(
+  await provider.ensureReady();
+  searchStage("embedding_provider_ready");
+  const vector = await withRetry(
     () => provider.embedSingle(`${effectiveQueryPrefix}${query}`),
     "Query embedding",
   );
+  searchStage("query_embedded");
+  return vector;
 }
 
 /**

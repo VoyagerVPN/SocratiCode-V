@@ -14,6 +14,8 @@ Set up, index, and manage SocratiCode codebase indexing, file watching, code gra
 
 ## First-Time Setup
 
+При настройке SocratiCode проверьте `.socraticodeignore` в корне проекта. Если файла ещё нет, создайте его с исключениями по фактическому дереву проекта. Как только при настройке или дальнейшей работе впервые встретится авторитетный документ, который пригодится снова, сразу создайте рядом `.socraticodecontextartifacts.json` и добавьте документ в массив `artifacts`. Укажите устойчивое `name`, путь относительно корня в `path` и в `description` — на какие вопросы документ отвечает. Одного источника достаточно. Если каталог уже есть, дополните его, сохранив прежние записи и исключив дубли по пути.
+
 1. **Check infrastructure**: `codebase_health` — verifies Docker, Qdrant, Ollama/embedding provider, and embedding model
 2. **Start indexing**: `codebase_index` — runs in background, returns immediately
 3. **Poll progress**: `codebase_status` — call every ~60 seconds until 100% complete

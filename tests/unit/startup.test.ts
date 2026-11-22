@@ -211,10 +211,13 @@ describe("autoResumeIndexedProjects", () => {
   });
 
   it("skips when projectPath is HOME", async () => {
-    const home = process.env.HOME ?? "/tmp";
-    await autoResumeIndexedProjects(home);
-
-    expect(mockListCollections).not.toHaveBeenCalled();
+    const home = path.resolve(process.env.HOME ?? "/tmp");
+    // Windows может не задавать HOME; тест явно создаёт проверяемое окружение.
+    vi.stubEnv("HOME", home);
+    try {
+      await autoResumeIndexedProjects(home);
+      expect(mockListCollections).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("skips when project has no collection (not yet indexed)", async () => {

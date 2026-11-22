@@ -164,7 +164,7 @@ describe("read-only metadata compatibility", () => {
       .mockResolvedValueOnce({ points: [point("first.ts")] })
       .mockResolvedValueOnce({ points: [point("second.ts")] });
 
-    const results = await searchMultipleCollections(
+    const { results } = await searchMultipleCollections(
       [
         { name: `${QDRANT_COLLECTION_PREFIX}codebase_first`, label: "first" },
         { name: `${QDRANT_COLLECTION_PREFIX}codebase_second`, label: "second" },

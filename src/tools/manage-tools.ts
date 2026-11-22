@@ -1,59 +1,13 @@
+import { getProjectCatalog } from "../services/project-catalog.js";
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-import { QDRANT_COLLECTION_PREFIX, QDRANT_HOST, QDRANT_MODE, QDRANT_PORT, QDRANT_URL, SOCRATICODE_VERSION } from "../constants.js";
-import { getArtifactStatusSummary } from "../services/context-artifacts.js";
+import { QDRANT_HOST, QDRANT_MODE, QDRANT_PORT, QDRANT_URL, SOCRATICODE_VERSION } from "../constants.js";
 import { isDockerAvailable, isQdrantImagePresent, isQdrantRunning } from "../services/docker.js";
 import { getEmbeddingConfig } from "../services/embedding-config.js";
 import { getEmbeddingProvider } from "../services/embedding-provider.js";
-import { getGraphMetadata, getProjectMetadata, listCodebaseCollections } from "../services/qdrant.js";
+import { listCodebaseCollections } from "../services/qdrant.js";
 import type { HealthStatus } from "../types.js";
-
-/** Quick infrastructure check for embedding in codebase_about */
-async function getInfraStatusSummary(): Promise<string[]> {
-  const lines: string[] = [];
-  const config = getEmbeddingConfig();
-  try {
-    if (QDRANT_MODE === "external") {
-      const endpoint = QDRANT_URL ?? `http://${QDRANT_HOST}:${QDRANT_PORT}`;
-      try {
-        await listCodebaseCollections(); // throws if unreachable
-        const provider = await getEmbeddingProvider();
-        const health = await provider.healthCheck();
-        if (health.available) {
-          lines.push(`Infrastructure: ✅ External Qdrant reachable (${endpoint}), ${config.embeddingProvider} embeddings ready`);
-        } else {
-          lines.push(`Infrastructure: ⚠️ External Qdrant reachable (${endpoint}), but ${config.embeddingProvider} embeddings not ready`);
-        }
-      } catch {
-        lines.push(`Infrastructure: ❌ Cannot reach external Qdrant at ${endpoint}`);
-        lines.push("  Check QDRANT_URL / QDRANT_HOST and make sure the server is running.");
-      }
-    } else {
-      const docker = await isDockerAvailable();
-      if (!docker) {
-        lines.push("Infrastructure: ❌ Docker not available");
-        lines.push("  Install from https://docker.com and start Docker Desktop.");
-        return lines;
-      }
-      const qdrant = await isQdrantRunning();
-      const provider = await getEmbeddingProvider();
-      const health = await provider.healthCheck();
-      if (qdrant && health.available) {
-        lines.push(`Infrastructure: ✅ All services running (Docker, Qdrant, ${config.embeddingProvider} embeddings)`);
-      } else {
-        const missing: string[] = [];
-        if (!qdrant) missing.push("Qdrant");
-        if (!health.available) missing.push(`${config.embeddingProvider} embeddings`);
-        lines.push(`Infrastructure: ⚠️ Docker OK, but ${missing.join(" and ")} not running`);
-        lines.push("  Run codebase_index or codebase_health to auto-start services.");
-      }
-    }
-  } catch {
-    lines.push("Infrastructure: ❓ Could not check status");
-  }
-  return lines;
-}
 
 export async function handleManageTool(
   name: string,
@@ -110,9 +64,14 @@ export async function handleManageTool(
       // Embedding provider health check (works for ollama, openai, google)
       lines.push("");
       lines.push(`Embedding provider: ${config.embeddingProvider}`);
-      const provider = await getEmbeddingProvider();
-      const health = await provider.healthCheck();
-      lines.push(...health.statusLines);
+      try {
+        const provider = await getEmbeddingProvider();
+        const health = await provider.healthCheck();
+        lines.push(...health.statusLines);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`${icon(false)} Embedding provider check failed: ${message}`);
+      }
 
       lines.push("");
       if (QDRANT_MODE === "external") {
@@ -129,78 +88,15 @@ export async function handleManageTool(
     }
 
     case "codebase_list_projects": {
-      try {
-        const collections = await listCodebaseCollections();
-
-        if (collections.length === 0) {
-          return "No projects have been indexed yet. Use codebase_index to index a project.";
-        }
-
-        // All four references below honour QDRANT_COLLECTION_PREFIX so this
-        // tool keeps working on shared Qdrant deployments where SocratiCode's
-        // collection names carry an instance-specific prefix.
-        const p = QDRANT_COLLECTION_PREFIX;
-        const codebasePrefix = `${p}codebase_`;
-        const graphPrefix = `${p}codegraph_`;
-        const codebaseCollections = collections.filter((c) => c.startsWith(codebasePrefix));
-        const graphCollections = collections.filter((c) => c.startsWith(graphPrefix));
-
-        const lines = ["Indexed projects:\n"];
-
-        for (const c of codebaseCollections) {
-          const projectId = c.slice(codebasePrefix.length);
-          const hasGraph = graphCollections.includes(`${graphPrefix}${projectId}`);
-          const metadata = await getProjectMetadata(c);
-          const pathInfo = metadata?.projectPath || "(path unknown — indexed before path tracking)";
-          lines.push(`  - ${pathInfo}`);
-          lines.push(`    Collection: ${c}`);
-          if (metadata?.lastIndexedAt) {
-            lines.push(`    Last indexed: ${metadata.lastIndexedAt}`);
-          }
-          if (metadata?.filesIndexed !== undefined) {
-            if (metadata.indexingStatus === "in-progress") {
-              lines.push(`    Files: ${metadata.filesIndexed}/${metadata.filesTotal} (INCOMPLETE — run codebase_index to resume)`);
-            } else {
-              lines.push(`    Files: ${metadata.filesIndexed}`);
-            }
-          }
-          if (hasGraph) {
-            const graphMeta = await getGraphMetadata(`${graphPrefix}${projectId}`);
-            if (graphMeta) {
-              lines.push(`    Code graph: ${graphMeta.nodeCount} files, ${graphMeta.edgeCount} edges (built: ${graphMeta.lastBuiltAt})`);
-            } else {
-              lines.push(`    Code graph: present`);
-            }
-          } else {
-            lines.push(`    Code graph: not built`);
-          }
-          // Context artifacts
-          try {
-            const pathInfo2 = metadata?.projectPath;
-            if (pathInfo2) {
-              const artifactSummary = await getArtifactStatusSummary(pathInfo2);
-              if (artifactSummary) {
-                lines.push(`    ${artifactSummary.lines[0]}`);
-              }
-            }
-          } catch {
-            // non-critical
-          }
-        }
-
-        return lines.join("\n");
-      } catch {
-        return "Could not connect to Qdrant. Run codebase_health to check infrastructure status.";
-      }
+      try { return JSON.stringify(await getProjectCatalog(_args)); }
+      catch (error) { return `Project catalog unavailable: ${error instanceof Error ? error.message : String(error)}`; }
     }
 
     case "codebase_about": {
-      const infraStatus = await getInfraStatusSummary();
       return [
         "SocratiCode — Codebase intelligence MCP server",
         "Hybrid semantic + keyword search, dependency graphs, context artifacts.",
         "",
-        ...infraStatus,
         "",
         "━━━ Quick Reference ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
@@ -213,7 +109,7 @@ export async function handleManageTool(
         "  codebase_watch        — Start/stop/status of live file watcher.",
         "",
         "Search:",
-        "  codebase_search       — Hybrid semantic + BM25 search. Use after indexing.",
+        "  codebase_search       — Hybrid semantic + BM25 search over stored snapshots; budget and continuation.",
         "  codebase_status       — Check index status, progress, watcher state.",
         "",
         "Dependency Graph:",
@@ -224,6 +120,10 @@ export async function handleManageTool(
         "  codebase_graph_visualize — Mermaid diagram (default) or interactive HTML explorer (mode=\"interactive\"), colour-coded by language.",
         "  codebase_graph_status — Poll graph build progress.",
         "  codebase_graph_remove — Delete a project's graph.",
+        "  codebase_symbol       — Definition, callers and callees of a symbol.",
+        "  codebase_symbols      — Paginated symbol lookup by file/name.",
+        "  codebase_impact       — Transitive callers in the resolved graph.",
+        "  codebase_flow         — Forward call flow or entry-point discovery.",
         "",
         "Context Artifacts:",
         "  codebase_context        — List artifacts (.socraticodecontextartifacts.json).",
@@ -233,14 +133,14 @@ export async function handleManageTool(
         "",
         "Management:",
         "  codebase_health       — Check Docker, Qdrant, embeddings status.",
-        "  codebase_list_projects — List all indexed projects.",
+        "  codebase_list_projects — Current project and indexed sources; scope=all for machine inventory.",
         "",
         "━━━ Typical Workflow ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
-        "1. codebase_index → poll codebase_status until complete.",
-        "2. codebase_search to find code. Search before reading files.",
-        "3. codebase_graph_query to explore dependencies.",
-        "4. codebase_context_search for schemas, API specs, configs.",
+        "1. codebase_list_projects { projectPath } → inspect this index and its sources.",
+        "2. codebase_search → ranked code in structuredContent.entries; maxChars bounds the response.",
+        "3. codebase_graph_query for files; codebase_symbol / symbols / impact / flow for symbol relations.",
+        "4. Index only a requested missing project/source. Search can use marked partial snapshots.",
         "",
         `v${SOCRATICODE_VERSION} · © 2026 Giancarlo Erra — Altaire Limited · AGPL-3.0`,
         "https://github.com/giancarloerra/socraticode",

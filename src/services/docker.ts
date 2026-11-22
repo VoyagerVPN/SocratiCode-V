@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { promisify } from "node:util";
 import {
   OLLAMA_CONTAINER_NAME,
@@ -16,6 +18,7 @@ import {
   QDRANT_PORT,
   QDRANT_URL,
 } from "../constants.js";
+import { ollamaDisplayOrigin } from "./embedding-config.js";
 import { logger } from "./logger.js";
 
 const execFileAsync = promisify(execFile);
@@ -25,7 +28,7 @@ export type InfraProgressCallback = (message: string) => void;
 
 async function run(cmd: string, args: string[], timeoutMs = 120_000): Promise<{ stdout: string; stderr: string }> {
   try {
-    return await execFileAsync(cmd, args, { timeout: timeoutMs });
+    return await execFileAsync(cmd, args, { timeout: timeoutMs, windowsHide: true });
   } catch (err: unknown) {
     const e = err as { stdout?: string; stderr?: string; message?: string; killed?: boolean };
     if (e.killed) {
@@ -104,14 +107,17 @@ async function doesQdrantContainerExist(): Promise<boolean> {
 
 /** Start the Qdrant container, creating it if necessary */
 export async function startQdrant(onProgress?: InfraProgressCallback): Promise<void> {
-  if (await isQdrantRunning()) return;
+  if (await isQdrantRunning()) {
+    await waitForService(`http://${QDRANT_HOST}:${QDRANT_PORT}/readyz`, "Qdrant", 120);
+    return;
+  }
 
   if (await doesQdrantContainerExist()) {
     onProgress?.("Starting existing Qdrant container...");
     logger.info("Starting existing Qdrant container");
     await run("docker", ["start", QDRANT_CONTAINER_NAME]);
     onProgress?.("Waiting for Qdrant to be ready...");
-    await waitForService(`http://${QDRANT_HOST}:${QDRANT_PORT}/healthz`, "Qdrant");
+    await waitForService(`http://${QDRANT_HOST}:${QDRANT_PORT}/readyz`, "Qdrant", 120);
     return;
   }
 
@@ -135,13 +141,14 @@ export async function startQdrant(onProgress?: InfraProgressCallback): Promise<v
   }
 
   onProgress?.("Waiting for Qdrant to be ready...");
-  await waitForService(`http://${QDRANT_HOST}:${QDRANT_PORT}/healthz`, "Qdrant");
+  await waitForService(`http://${QDRANT_HOST}:${QDRANT_PORT}/readyz`, "Qdrant", 120);
 }
 
 // ── Readiness cache ──────────────────────────────────────────────────────
 
 const READINESS_TTL_MS = 60_000; // 60 seconds
 let qdrantReadyAt = 0;
+let qdrantReadyAttempt: Promise<{ started: boolean; pulled: boolean }> | undefined;
 
 /** Reset the cached readiness state (e.g. after infra error or explicit restart) */
 export function resetQdrantReadinessCache(): void {
@@ -153,13 +160,30 @@ export function resetQdrantReadinessCache(): void {
  * - external mode: validate config and health-check the remote endpoint.
  */
 export async function ensureQdrantReady(onProgress?: InfraProgressCallback): Promise<{ started: boolean; pulled: boolean }> {
+  if (qdrantReadyAttempt) return qdrantReadyAttempt;
+  const attempt = checkQdrantReady(onProgress);
+  qdrantReadyAttempt = attempt;
+  try {
+    return await attempt;
+  } finally {
+    if (qdrantReadyAttempt === attempt) qdrantReadyAttempt = undefined;
+  }
+}
+
+async function checkQdrantReady(onProgress?: InfraProgressCallback): Promise<{ started: boolean; pulled: boolean }> {
   // Fast path: recently verified as ready
-  if (Date.now() - qdrantReadyAt < READINESS_TTL_MS) {
+  if (QDRANT_MODE === "external" && Date.now() - qdrantReadyAt < READINESS_TTL_MS) {
     return { started: false, pulled: false };
   }
 
   if (QDRANT_MODE === "external") {
     return ensureExternalQdrantReady(onProgress);
+  }
+
+  // Здоровый сервис не требует дорогих проверок Docker CLI.
+  if (await serviceResponds(`http://${QDRANT_HOST}:${QDRANT_PORT}/readyz`)) {
+    qdrantReadyAt = Date.now();
+    return { started: false, pulled: false };
   }
 
   // ── managed mode: Docker-managed container ────────────────────────────
@@ -184,6 +208,8 @@ export async function ensureQdrantReady(onProgress?: InfraProgressCallback): Pro
     started = true;
   }
 
+  // Running не гарантирует завершения загрузки коллекций после холодного запуска.
+  await waitForService(`http://${QDRANT_HOST}:${QDRANT_PORT}/readyz`, "Qdrant", 120);
   qdrantReadyAt = Date.now();
   return { started, pulled };
 }
@@ -321,12 +347,28 @@ export async function startOllama(onProgress?: InfraProgressCallback): Promise<v
 
   onProgress?.("Creating and starting Ollama container...");
   logger.info("Creating and starting Ollama container", { port: OLLAMA_PORT });
+  // Локальный профиль явно включает GPU; обычная конфигурация сохраняет прежнее поведение.
+  const gpus = process.env.SOCRATICODE_OLLAMA_GPUS;
+  const gpuArgs = gpus ? [
+    "--gpus", gpus,
+    "-e", "OLLAMA_CONTEXT_LENGTH=2048",
+    "-e", "OLLAMA_MAX_LOADED_MODELS=1",
+    "-e", "OLLAMA_NUM_PARALLEL=1",
+    "-e", "OLLAMA_KEEP_ALIVE=10m",
+  ] : [];
+  const cudaCache = process.env.SOCRATICODE_CUDA_CACHE_PATH;
+  if (gpus && cudaCache) {
+    if (!path.isAbsolute(cudaCache)) throw new Error("SOCRATICODE_CUDA_CACHE_PATH must be absolute");
+    await fs.mkdir(cudaCache, { recursive: true });
+    gpuArgs.push("--mount", `type=bind,source=${cudaCache},target=/cuda-cache`, "-e", "CUDA_CACHE_PATH=/cuda-cache");
+  }
   try {
     await run("docker", [
       "run", "-d",
       "--name", OLLAMA_CONTAINER_NAME,
       "-p", `${OLLAMA_PORT}:11434`,
       "-v", "socraticode_ollama_data:/root/.ollama",
+      ...gpuArgs,
       "--restart", "unless-stopped",
       OLLAMA_IMAGE,
     ]);
@@ -342,6 +384,7 @@ export async function startOllama(onProgress?: InfraProgressCallback): Promise<v
 }
 
 let ollamaContainerReadyAt = 0;
+let ollamaContainerReadyAttempt: Promise<{ started: boolean; pulled: boolean }> | undefined;
 
 /** Reset the cached readiness state for Ollama container */
 export function resetOllamaContainerReadinessCache(): void {
@@ -350,8 +393,23 @@ export function resetOllamaContainerReadinessCache(): void {
 
 /** Ensure Docker is available, Ollama image is pulled, and Ollama container is running */
 export async function ensureOllamaContainerReady(onProgress?: InfraProgressCallback): Promise<{ started: boolean; pulled: boolean }> {
-  // Fast path: recently verified as ready
+  if (ollamaContainerReadyAttempt) return ollamaContainerReadyAttempt;
+  const attempt = checkOllamaContainerReady(onProgress);
+  ollamaContainerReadyAttempt = attempt;
+  try {
+    return await attempt;
+  } finally {
+    if (ollamaContainerReadyAttempt === attempt) ollamaContainerReadyAttempt = undefined;
+  }
+}
+
+async function checkOllamaContainerReady(onProgress?: InfraProgressCallback): Promise<{ started: boolean; pulled: boolean }> {
   if (Date.now() - ollamaContainerReadyAt < READINESS_TTL_MS) {
+    return { started: false, pulled: false };
+  }
+
+  if (await serviceResponds(`${OLLAMA_HOST}/api/tags`)) {
+    ollamaContainerReadyAt = Date.now();
     return { started: false, pulled: false };
   }
 
@@ -382,16 +440,28 @@ export async function ensureOllamaContainerReady(onProgress?: InfraProgressCallb
 
 // ── Shared ────────────────────────────────────────────────────────────────
 
+/** Короткий HTTP-запрос ограничивает ожидание до восстановления через Docker. */
+async function serviceResponds(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+    await response.arrayBuffer();
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+
 /** Wait for an HTTP service to respond with 200.
  *
  * `init` is forwarded to fetch(), allowing callers to attach headers (e.g. an
  * `api-key` header for Qdrant Cloud, whose /healthz endpoint requires auth).
  */
 async function waitForService(url: string, serviceName: string, retries = 30, delayMs = 1000, init?: RequestInit): Promise<void> {
-  logger.info(`Waiting for ${serviceName} to be ready`, { url });
+  logger.info(`Waiting for ${serviceName} to be ready`, { url: serviceName === "Ollama" ? ollamaDisplayOrigin(url) : url });
   for (let i = 0; i < retries; i++) {
     try {
-      const resp = await fetch(url, init);
+      const resp = await fetch(url, { ...init, signal: AbortSignal.timeout(2_000) });
       if (resp.ok) {
         logger.info(`${serviceName} is ready`);
         return;

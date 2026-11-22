@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getLogLevel, logger, setLogLevel, setMcpLogSender } from "../../src/services/logger.js";
+import { getLogLevel, logger, runWithMcpLogSender, setLogLevel, setMcpLogSender } from "../../src/services/logger.js";
 
 type SenderFn = Parameters<typeof setMcpLogSender>[0];
 
@@ -189,5 +189,21 @@ describe("logger", () => {
       senderMock.mockImplementation(() => { throw new Error("transport closed"); });
       expect(() => logger.info("test")).not.toThrow();
     });
+  });
+});
+
+
+describe("parallel MCP logging", () => {
+  it("keeps asynchronous logs with the request that created them", async () => {
+    const received: string[][] = [[], [], [], [], []];
+    await Promise.all(received.map((entries, index) => runWithMcpLogSender(
+      (entry) => entries.push(entry.data),
+      async () => {
+        logger.info(`start-${index}`);
+        await new Promise<void>((resolve) => setTimeout(resolve, 10 - index));
+        logger.info(`finish-${index}`);
+      },
+    )));
+    received.forEach((entries, index) => { expect(entries).toEqual([`start-${index}`, `finish-${index}`]); });
   });
 });

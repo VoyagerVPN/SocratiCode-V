@@ -54,6 +54,34 @@ function makeMockProvider(embedImpl?: (texts: string[]) => Promise<number[][]>) 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("embeddings", () => {
+  it.each(["query", "documents"] as const)("awaits provider readiness before generating %s vectors", async (kind) => {
+    const provider = makeMockProvider();
+    let releaseReady: (() => void) | undefined;
+    provider.ensureReady.mockImplementation(async () => {
+      await new Promise<void>((resolve) => { releaseReady = resolve; });
+      return { modelPulled: false, containerStarted: false, imagePulled: false };
+    });
+    vi.mocked(getEmbeddingProvider).mockResolvedValue(provider);
+    const pending = kind === "query" ? generateQueryEmbedding("query") : generateEmbeddings(["document"]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(provider.ensureReady).toHaveBeenCalledOnce();
+    expect(provider.embed).not.toHaveBeenCalled();
+    expect(provider.embedSingle).not.toHaveBeenCalled();
+    releaseReady?.();
+    await pending;
+    expect(kind === "query" ? provider.embedSingle : provider.embed).toHaveBeenCalledOnce();
+  });
+
+  it.each(["query", "documents"] as const)("does not generate %s vectors after a failed provider resume", async (kind) => {
+    const provider = makeMockProvider();
+    provider.ensureReady.mockRejectedValue(new Error("resume unavailable"));
+    vi.mocked(getEmbeddingProvider).mockResolvedValue(provider);
+    const pending = kind === "query" ? generateQueryEmbedding("query") : generateEmbeddings(["document"]);
+    await expect(pending).rejects.toThrow("resume unavailable");
+    expect(provider.embed).not.toHaveBeenCalled();
+    expect(provider.embedSingle).not.toHaveBeenCalled();
+  });
   // ── prepareDocumentText ────────────────────────────────────────────────────
 
   describe("prepareDocumentText", () => {

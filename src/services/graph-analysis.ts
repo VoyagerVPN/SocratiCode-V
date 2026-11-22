@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
+import { z } from "zod";
 import { getLanguageFromExtension, toForwardSlash } from "../constants.js";
-import type { CodeGraph, CodeGraphNode } from "../types.js";
+import type { CodeGraph, CodeGraphNode, ImportCoverage } from "../types.js";
 
 /**
  * Resolve a graph node's language for display/stats. Prefers the language stored
@@ -215,7 +216,17 @@ export function describeGraphBuilder(
  * name, so a runtime or external-library callee is indistinguishable from a
  * project method that failed to resolve (issue #172).
  */
-export function describeUnresolvedSymbolEdges(unresolvedEdgePct: number): string[] {
+export function describeUnresolvedSymbolEdges(unresolvedEdgePct: number, coverage?: import("../types.js").SymbolGraphCoverage): string[] {
+  if (coverage) {
+    const known = coverage.resolvedProject + coverage.ambiguousProject + coverage.unresolvedProject;
+    return [
+      "  Project edges: " + known + " (resolved " + coverage.resolvedProject + ", ambiguous " + coverage.ambiguousProject + ")",
+      "  Unresolved project edges: " + coverage.unresolvedProject,
+      "  External package edges: " + coverage.external,
+      "  Runtime/engine edges: " + coverage.runtime,
+      "  Unknown target edges: " + coverage.unknown + " (excluded from project coverage; not assumed external)",
+    ];
+  }
   return [
     `  Unresolved: ${unresolvedEdgePct.toFixed(1)}% of captured symbol edges did not match a project symbol`,
     "    Symbol edges are calls, imports, re-exports and type or value references. Edges into runtime builtins and external libraries (setTimeout, JSON.stringify, an SDK client's methods) count here, since no project symbol can resolve them, and only GDScript engine calls are left out; the share runs high on healthy code and is not a resolver failure rate.",
@@ -426,4 +437,28 @@ export function generateMermaidDiagram(graph: CodeGraph): string {
   }
 
   return lines.join("\n");
+}
+
+export function computeImportCoverage(graph: CodeGraph): ImportCoverage {
+  const result: ImportCoverage = { total: 0, projectResolved: 0, projectUnresolved: 0, external: 0, runtime: 0, unknown: 0 };
+  for (const node of graph.nodes) for (const specifier of node.imports) {
+    result.total++;
+    const scope = node.importScopes?.[specifier];
+    if (node.importTargets?.[specifier]) result.projectResolved++;
+    else if (scope === "project") result.projectUnresolved++;
+    else if (scope === "external") result.external++;
+    else if (scope === "runtime") result.runtime++;
+    else result.unknown++;
+  }
+  return result;
+}
+
+const importCoverageSchema = z.object({
+  total: z.number().int().nonnegative(), projectResolved: z.number().int().nonnegative(),
+  projectUnresolved: z.number().int().nonnegative(), external: z.number().int().nonnegative(),
+  runtime: z.number().int().nonnegative(), unknown: z.number().int().nonnegative(),
+});
+export function readImportCoverage(value: unknown): ImportCoverage | undefined {
+  const result = importCoverageSchema.safeParse(value);
+  return result.success ? result.data : undefined;
 }

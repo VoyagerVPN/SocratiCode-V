@@ -265,7 +265,7 @@ const { searchMultipleCollections } = await import("../../src/services/qdrant.js
 
 describe("searchMultipleCollections", () => {
   it("returns empty array when collections array is empty", async () => {
-    const results = await searchMultipleCollections([], "test", 10);
+    const { results } = await searchMultipleCollections([], "test", 10);
     expect(results).toEqual([]);
   });
 });

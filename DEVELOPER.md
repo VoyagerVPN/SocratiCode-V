@@ -952,18 +952,36 @@ TypeScript / JavaScript / TSX, Python, Go, Rust, Java, Kotlin, Scala, C#, C, C++
 - `multiple-candidates` — name matched in more than one dependency; all candidates kept
 - `unresolved` — no symbol found anywhere reachable; left as a name-only edge
 
-`SymbolGraphMeta.unresolvedEdgePct` is the percentage of captured symbol edges that matched no project symbol: `confidence: "unresolved"` over every `SymbolEdge` of any kind (call, import, re-export, type or value reference), the GDScript `engine` ones excepted. A member call is reduced to its terminal name, so a call into a runtime builtin or an external library (`setTimeout`, `JSON.stringify`, an SDK client's `pull`) is counted exactly like a project method that failed to resolve: the resolver cannot tell an external `includes` from a project one, and a callee-name allowlist would misclassify legitimate project methods. Read the value as coverage of the project's own symbols, not as a resolver failure rate; it runs high on healthy TypeScript/JavaScript code (issue #172).
+- `external` — импорт из объявленного npm-пакета вне допущенных исходников проекта
+- `runtime` — Node builtin module либо проверенный глобальный JS объект/функция без локального shadowing
+- `engine` — API Godot вне символов проекта
+
+`SymbolGraphMeta.coverage` разделяет доказанные связи проекта (resolved/ambiguous/unresolved), внешние пакеты, runtime/engine и unknown. JS/TS сохраняет receiver и происхождение binding; aliases проверяются по точному результату файлового resolver. Неразрешённый относительный импорт, alias или локальный пакет не становится external. Локальные npm-пакеты узнаются по manifest каталогов уже допущенных исходников; установленный node_modules для этого не читается. Вызов метода неизвестного receiver не сопоставляется с локальным методом по одному terminal name. Статистика импортов файла использует `importCoverage` с теми же областями назначения.
+
+`unresolvedEdgePct` остаётся сырым агрегатом захваченных рёбер, кроме external/runtime/engine; unknown входит в этот агрегат. Graph status новых графов показывает отдельные счётчики вместо этого процента. Старые снимки без coverage не переклассифицируются на чтении: они сохраняют прежнее описание и обновляются при явной или необходимой инкрементальной сборке. Это не оценка полноты AST и не гарантия полного call graph.
+
+#### Unreal C++ RPC
+
+Для вызова из метода того же класса (`Fire()` или `this->Fire()`) используйте `codebase_flow` с глубиной от 2. Узел объявления получает метку, например `[Unreal Server RPC]`. Следующим узлом будет `Fire_Implementation`, если граф нашёл определение того же класса в файле, который включает заголовок. Запрос `codebase_symbol` от обработчика показывает обратную ссылку на объявление. Разбор учитывает сетевые спецификаторы `Server`, `Client`, `Remote` и `NetMulticast` в `UFUNCTION`.
+
+Граф показывает статический маршрут в C++. Доставка вызова в конкретной игровой сессии зависит от владельца объекта, репликации и условий выполнения. Для Blueprint-графов и вызовов через объект неизвестного типа требуется отдельная проверка. [Документация Unreal Engine об RPC](https://dev.epicgames.com/documentation/unreal-engine/remote-procedure-calls-in-unreal-engine)
+
+#### Как читать маршруты Unreal C++ в `codebase_flow`
+
+Метка над переходом указывает, почему граф связал два участка кода. Например, если один объект подписывает метод через `AddUObject`, а другой вызывает `Broadcast()` у того же объявленного multicast-делегата, граф покажет обработчик с именем события. Чтобы проверить такой переход, откройте объявление поля, место подписки и место рассылки. Сработает ли обработчик в игре, зависит в том числе от того, подписан ли объект в момент рассылки.
+
+Для `UE::Tasks::Launch` граф создаёт узел тела переданной лямбды. Из него видны вызовы внутри задачи и отдельная связь `result read: GetResult` с методом, читающим результат через прослеженный handle. Для полей `TQueue` связь `queue: Enqueue / Dequeue` указывает возможный обмен через одну очередь. Для `TSet` и `TArray` метка `pending state: Add / IsEmpty + Reset` означает, что второй метод проверяет и очищает общий набор. Порядок вызовов в игре и идентичность конкретного элемента требуют отдельного подтверждения. Связи передачи данных в `codebase_symbol` имеют тип `data_flow`.
 
 #### Accepted limits — what the call graph does not see
 
 The call graph is built from static analysis without type inference. These classes of call patterns are silently absent from the graph **by design**:
 
 - **Dynamic dispatch** — Python `getattr(obj, name)(...)`, JavaScript `obj[key](...)`, `eval`, language-level reflection. The callee is only known at runtime; the static extractor captures the literal call sites it can see and nothing more.
-- **Method resolution without receiver type** — `obj.foo()` resolves by the bare name `foo` against every dependency that exports a `foo`. Receiver type is informational in the output, never a pruning filter. Two unrelated classes with a `foo` method both appear as candidates on an ambiguous edge (`confidence: "multiple-candidates"`).
+- **Method resolution without receiver type** — JS/TS `obj.foo()` остаётся unknown, если происхождение receiver не доказано импортом либо текущим классом (`this`). Типы произвольных экземпляров не выводятся. Другие языки сохраняют собственные правила разрешения; непроверенные назначения видны отдельно от известных внешних API.
 - **Macros** — Rust (`println!`, custom `macro_rules!`) and C / C++ preprocessor macros are not expanded. Macro invocations are captured as calls to the macro *name*, not to whatever the expansion actually calls.
 - **Framework magic** — Dependency injection (Spring `@Autowired`, Angular DI, NestJS providers), ORM metaprogramming (Rails `has_many`, ActiveRecord callbacks), decorator-driven routing where the handler is never named at a call site (Django class-based view dispatch, some FastAPI patterns), and similar indirection goes through the framework rather than through a direct call. A method that is only called via `@Autowired` will show zero callers in `codebase_impact`.
 
-`SymbolGraphMeta.unresolvedEdgePct` is the quality signal for this class of limit, read with the definition above: the share counts every captured symbol edge that no project symbol matched, GDScript `engine` calls excepted, runtime and external APIs included, so a high value on a runtime-heavy codebase is the expected shape rather than a finding, and the number alone does not separate a genuine gap (heavy framework magic, a language where extractor coverage is incomplete) from those external calls. Users running `codebase_impact` on a service-oriented codebase with heavy DI should treat "zero callers" as a hint to double-check, not a guarantee.
+Счётчики coverage описывают только захваченные статические связи. Нулевой impact требует учитывать unknown и динамические вызовы; он не гарантирует отсутствие потребителей.
 
 #### Per-file incremental updates (Phase F)
 
@@ -1726,3 +1744,45 @@ docker volume rm socraticode_qdrant_data
 ```
 
 The server will recreate everything automatically on next use.
+
+
+### Пагинация MCP списков
+
+`codebase_symbols` и `codebase_graph_query` по умолчанию возвращают компактный текст, а `structuredContent` содержит управление страницами и покрытие. Граф: `→` импортируемый файл, `←` зависимый файл. Символы сгруппированы по файлу: kind, суффикс точного ID, диапазон строк; полный ID = file + `::` + suffix (для codebase_impact). codebase_symbol принимает name + file. `format: "json"` возвращает полные записи в `structuredContent.entries` и короткий текст без их копии. `returned/total/offset/hasMore/nextCursor` доступны в обоих форматах; total считается до limit. В compact нет повторяющих эти значения truncated/totalRelation и длинной revision; truncationReason присутствует при продолжении, непустые warnings — при предупреждениях, partial сохраняется всегда.
+
+`limit`: 1–1000, default 200; `maxChars`: 512–100000, default 12000. Бюджет — длина JSON всего MCP result с SDK serverInfo, text, structuredContent и isError, без JSON-RPC envelope; символы не равны токенам. В бюджет входят целые записи и предупреждения. Если даже одна запись либо предупреждения не помещаются, `budget_too_small/isError` предлагает увеличить бюджет/сузить фильтр, не выдаёт cursor без продвижения.
+
+`nextCursor` привязан к инструменту, проекту, фильтрам и ревизии снимка, переносим между stateless клиентами. Limit, maxChars и format допускается менять; фильтры — нет. Курсор бинарный base64url длиной 92 символа; hashes запроса и ревизии сохранены полностью. Прежний формат курсора не поддерживается. `cursor_invalid` и `cursor_stale` требуют начать новую выдачу. Переход поколения во время чтения повторяется ограниченно, без смешивания записей двух поколений.
+
+Для автоматических тестов использовать проектный preload: `node --require ./scripts/windows-test-processes.cjs node_modules/vitest/vitest.mjs run ...`. В pipes он отключает ANSI; полные stdout/stderr сохранять в проектную .cache, в отчёт выводить краткий текст, не util.inspect всего объекта с ANSI и экранированными строками.
+
+
+## Local MCP search response contract
+
+codebase_search defaults to compact text: each match contains rank, canonical path, line range, language, original score and stored code. Identical lines at the same coordinates within a page may refer to an earlier rank. Sources are named once in structuredContent.searchedSources; [n] in a multi-source match refers to searchedSources[n-1]. Markdown fences adapt to fences inside stored code. format=json returns full typed records (including stable content/location ids) only in structuredContent.entries, with a short text summary. No format duplicates records in both representations. Retrieval and multi-source merge algorithms are unchanged.
+
+- limit still selects the ranked candidate window (default SEARCH_DEFAULT_LIMIT, 1–50), before minScore. total counts surviving entries in that window; totalScope=ranked_window explicitly does not count all matches in the index. filteredCount reports threshold filtering.
+- maxChars is the serialized entire MCP result budget (default 12000, 512–100000), including SDK serverInfo, content, structuredContent and isError, excluding the JSON-RPC envelope. It counts JSON characters, not tokens or UTF-8 bytes.
+- JSON records and full source coverage must fit. Compact search can show a labelled line excerpt around a query term when a whole chunk exceeds the budget. budget_too_small is an MCP error with no non-advancing cursor and coverageKnown=false; minimumChars estimates the smallest successful remaining page. Increase the budget or narrow the request. Missing/error coverage is never presented as complete coverage.
+- nextCursor resumes a frozen selected window on the same shared server. Repeat projectPath, query, limit, scope/minScore/filters; maxChars and format may change. Search cursors are binary base64url strings of 71 characters, retaining the complete query hash, snapshot UUID and offset; older cursor encodings are rejected. Continuations do not run another embedding, retrieval, source refresh or watcher startup. snapshotAt and expiresAt describe the historical search and its coverage; they do not assert current disk contents.
+- Search cache is independent of MCP client sessions: five-minute fixed expiry, at most 64 snapshots and 8 MiB of serialized snapshot data (not a claim about total process RAM). Old snapshots may be evicted. Restart, expiry or eviction produces cursor_stale; changed query/filter/limit produces cursor_invalid. The graph-list cursor has a different lifecycle and is not interchangeable.
+- searchedSources and coverage flags are retained on every successful page. In compact output, empty failedSources/skippedSources/incompleteSources/warnings and a zero filteredCount are omitted; omission means an empty list/zero. Nonempty errors and warnings are retained in full on every continuation. In JSON output all fields are present. An all-source failure remains isError=true. The scores retain their existing mode-dependent meaning and are not confidence percentages.
+
+codebase_list_projects returns its catalog once in structuredContent; text gives only a short count/status summary.
+
+codebase_about is static help without infrastructure probes; codebase_health performs diagnostics. codebase_context returns a one-line empty result; help=true explicitly requests its setup example. codebase_update returns operation status and counts plus significant warnings, not accumulated progress history; the logger retains full progress. Cancellation/skipped updates remain distinct from completion.
+
+The startup manager retries one reset discovery connection (ECONNRESET/EPIPE/UND_ERR_SOCKET), still checking the server identity. A reset alone is not evidence that the port is free. Foreign services are neither replaced nor stopped.
+
+
+## 2026-10-06: vertical graph and controlled indexing
+
+The compact file graph groups paths vertically under Imports → and Dependents ←. Directions, unique records, cursors, JSON mode and whole-response budgets are unchanged.
+
+Index admission now previews chunk count and UTF-8 chunk-text bytes, not only files. Defaults: 2000 files, 20000 chunks, 33554432 bytes; request maxFiles/maxChunks/maxBytes and SOCRATICODE_INDEX_MAX_* override them. Preview uses the requested profile; the writer rechecks changed chunks under the effective stored profile before vector writes. Preview stops at a breached budget, returns complete=false with lower-bound counts and up to five contributors. Preview is available during indexing and does not start services or attach sources.
+
+Read/stat/chunk failures abort the scan without replacing old searchable vectors. Persisted in-progress metadata includes scanFailure; another client sees the cause and incomplete state. Successful retry clears it. Main-scope search now reports incomplete snapshots too.
+
+Stop checks cancellation before each embedding packet and before writing its unfinished file batch. Earlier checkpoints survive; unfinished vectors are discarded and recomputed on resume. Status displays cancelled separately from FAILED. Wait for the complete operation including graph/artifact phases, not only 100% embeddings.
+
+Validation: public MCP red/green for graph, read failure across clients with preserved old code, service-free budget rejection and cancellation/resume. GPU busy validation uses isolated Qdrant collections; existing projects are not reindexed.

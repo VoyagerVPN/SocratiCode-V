@@ -26,6 +26,11 @@ import { createIgnoreFilter, type IgnoreFilter, shouldIgnore } from "./ignore.js
  */
 export const GRAPH_INPUTS_VERSION = 1;
 
+function isUnrealModule(file: string): boolean {
+  return file.toLowerCase().endsWith(".build.cs");
+}
+
+
 /**
  * Every input the graph build actually consumed, persisted beside the graph.
  *
@@ -43,11 +48,13 @@ export const GRAPH_INPUTS_VERSION = 1;
  * | read a file whole | content hash | re-hashing it |
  * | read a file's head to classify it | head hash | re-reading that head |
  * | used a file without opening it | its size | a stat |
+ * | resolved an installed module lookup path | target hash or absence | resolving it again |
  * | tried to open one and could not | its path | trying again |
  * | listed a directory | its entry names | listing it again |
  * | tried to list one and could not | its path | listing it again |
  */
 export interface GraphInputRecord {
+  unrealRpcVersion?: number;
   version: number;
   /**
    * The SocratiCode version that produced this record. Compared on its own
@@ -78,6 +85,8 @@ export interface GraphInputRecord {
    * that was unknown.
    */
   presence: Record<string, number>;
+  /** Module lookup path → canonical target hash, or null when absent. */
+  realpaths?: Record<string, string | null>;
   /**
    * Files the build tried to open and could not — a manifest it found and
    * failed to read, a `tsconfig.json` that exists but is unreadable, a source
@@ -292,6 +301,8 @@ export interface GraphInputRecorder {
    * where it got that far.
    */
   present(absolutePath: string, size?: number): void;
+  /** A module lookup's native binding. Optional for existing recorder callers. */
+  realpath?(absolutePath: string, canonicalPath: string | null): void;
   /** An input the build tried to open and could not. */
   unreadable(absolutePath: string): void;
   /** A directory the walk tried to list and could not. */
@@ -315,6 +326,7 @@ export function createGraphInputRecorder(projectRoot: string): GraphInputRecorde
   const files = new Map<string, string>();
   const heads = new Map<string, string>();
   const presence = new Map<string, number>();
+  const realpaths = new Map<string, string | null>();
   const unreadable = new Set<string>();
   const unreadableDirectories = new Set<string>();
   const directories = new Map<string, DirectoryListing>();
@@ -390,6 +402,15 @@ export function createGraphInputRecorder(projectRoot: string): GraphInputRecorde
       const key = rel(absolutePath);
       if (!files.has(key) && !heads.has(key)) presence.set(key, size ?? -1);
     },
+    realpath(absolutePath, canonicalPath) {
+      const key = rel(absolutePath);
+      const hash = canonicalPath === null ? null : hashContent(toForwardSlash(canonicalPath));
+      if (realpaths.has(key) && realpaths.get(key) !== hash) {
+        conflict(key, "resolved twice, with different targets each time");
+        return;
+      }
+      realpaths.set(key, hash);
+    },
     unreadable(absolutePath) {
       const key = rel(absolutePath);
       // A file the build already read and then could not read is the same mixed
@@ -414,11 +435,13 @@ export function createGraphInputRecorder(projectRoot: string): GraphInputRecorde
       if (conflicts.size > 0) throw new GraphInputsMovedDuringBuild(new Map(conflicts));
       return {
         version: GRAPH_INPUTS_VERSION,
+        ...([...files.keys()].some(isUnrealModule) ? { unrealRpcVersion: 3 } : {}),
         builtByVersion: SOCRATICODE_VERSION,
         capabilities,
         files: sortedRecord(files),
         heads: sortedRecord(heads),
         presence: sortedRecord(presence),
+        ...(realpaths.size > 0 ? { realpaths: sortedRecord(realpaths) } : {}),
         unreadable: [...unreadable].sort(),
         unreadableDirectories: [...unreadableDirectories].sort(),
         directories: sortedRecord(directories),
@@ -459,6 +482,10 @@ export function parseGraphInputRecord(stored: unknown): GraphInputRecord | null 
   if (typeof record.capabilities !== "string") return null;
   if (!isStringMap(record.files)) return null;
   if (!isStringMap(record.heads)) return null;
+  if (record.realpaths !== undefined && (
+    record.realpaths === null || typeof record.realpaths !== "object" || Array.isArray(record.realpaths)
+    || Object.values(record.realpaths).some((target) => target !== null && typeof target !== "string")
+  )) return null;
   if (
     record.directories === null ||
     typeof record.directories !== "object" ||
@@ -600,6 +627,9 @@ export async function decideGraphRebuild(
     // however quiet the update was — `graphExists` is what says so.
     return rebuildFor("no usable record of what the graph was built from");
   }
+  if (record.unrealRpcVersion !== 3 && Object.keys(record.files).some(isUnrealModule)) {
+    return rebuildFor("Unreal module graph predates typed calls and event resolution");
+  }
   if (record.capabilities !== capabilities) {
     // Same version, different parsers: the optional grammars and the GDScript
     // addon ship platform-specific prebuilds, so a graph built where one was
@@ -654,6 +684,23 @@ export async function decideGraphRebuild(
       return rebuildFor(`graph input changed: ${relativePath}`);
     }
   }
+
+  const rebound = await inBatches(
+    Object.entries(record.realpaths ?? {}),
+    STAT_BATCH,
+    async ([relativePath]) => {
+      try {
+        return hashContent(toForwardSlash(await fs.realpath(path.resolve(root, relativePath))));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+        return null;
+      }
+    },
+    ([relativePath, recordedTarget], target) => target !== recordedTarget
+      ? rebuildFor(`module lookup binding changed: ${relativePath}`) : null,
+  );
+  if (rebound) return rebound;
 
   const sized = await inBatches(
     needStatting,

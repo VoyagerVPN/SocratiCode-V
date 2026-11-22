@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
-import { collectionName, projectIdFromPath, resolveLinkedCollections } from "../config.js";
+import { collectionName, projectIdFromPath } from "../config.js";
 import type { WatcherMode } from "../constants.js";
 import { getWatcherMode, SEARCH_DEFAULT_LIMIT, SEARCH_MIN_SCORE, SOCRATICODE_VERSION } from "../constants.js";
 import { getGraphStatus, isGraphBuilderStale } from "../services/code-graph.js";
@@ -16,6 +16,7 @@ import {
 import type { IndexingProgress } from "../services/indexer.js";
 import { getIndexingProgress, getLastCompleted, isIndexingInProgress } from "../services/indexer.js";
 import { getLockHolderPid } from "../services/lock.js";
+import { getProjectCatalog } from "../services/project-catalog.js";
 import {
   getCollectionInfo,
   getProjectMetadata,
@@ -23,8 +24,46 @@ import {
   searchChunks,
   searchMultipleCollections,
 } from "../services/qdrant.js";
+import { continueSearchPage, createSearchPage, type SearchToolResponse } from "../services/search-pages.js";
+import { searchStage } from "../services/startup-trace.js";
 import { ensureWatcherStarted, isWatchedByAnyProcess, isWatching } from "../services/watcher.js";
 import type { SearchResult } from "../types.js";
+
+export type { SearchToolResponse } from "../services/search-pages.js";
+
+interface SearchQueryResponse {
+  text: string;
+  isError: boolean;
+  structuredContent: {
+    status: "ok" | "empty" | "partial" | "failed" | "index_missing";
+    partial: boolean;
+    searchedSources: string[];
+    failedSources: Array<{ path: string; error: string }>;
+    skippedSources: string[];
+    incompleteSources: string[];
+    results: SearchResult[];
+    filteredCount: number;
+    warnings: string[];
+  };
+}
+
+/** MCP получает явное покрытие поиска вместе с текстовой выдачей. */
+export async function handleSearchTool(args: Record<string, unknown>): Promise<SearchToolResponse> {
+  const projectPath = typeof args.projectPath === "string" ? args.projectPath : process.cwd();
+  const resolvedArgs = { ...args, projectPath: path.resolve(projectPath) };
+  if (args.cursor !== undefined) return continueSearchPage(resolvedArgs);
+  let response: SearchQueryResponse | undefined;
+  const text = await withGitRefreshNotice(projectPath, async () => {
+    const result = await dispatchQueryTool("codebase_search", args);
+    if (typeof result === "string") throw new Error("Search response was not produced");
+    response = result;
+    return result.text;
+  });
+  if (!response) throw new Error("Search response was not produced");
+  const notices = text === response.text ? [] : [text.replace(response.text, "").trim()];
+  const { results, filteredCount, warnings, ...selection } = response.structuredContent;
+  return createSearchPage(resolvedArgs, results, selection, [...warnings, ...notices], filteredCount);
+}
 
 /** Format an IndexingProgress into display lines (elapsed, progress, batches, graph). */
 function formatProgressLines(progress: IndexingProgress): {
@@ -118,20 +157,56 @@ async function appendWatcherState(
   }
 }
 
+/** Пустой поиск поясняет точные фильтры с учётом реально выбранных источников. */
+async function filteredNoResultsLines(
+  query: string,
+  resolvedPath: string,
+  collection: string,
+  fileFilter: string | undefined,
+  languageFilter: string | undefined,
+  singleSource: boolean,
+): Promise<string[]> {
+  const indexing = isIndexingInProgress(resolvedPath);
+  if (singleSource && !indexing && (await getCollectionInfo(collection))?.pointsCount === 0) {
+    return [
+      `No results found for "${query}" in project ${resolvedPath}.`,
+      "Make sure the project has been indexed first using codebase_index.",
+    ];
+  }
+  const filters: string[] = [];
+  const hints: string[] = [];
+  if (fileFilter) {
+    filters.push(`fileFilter "${fileFilter}"`);
+    hints.push("fileFilter takes one file path exactly as a result header shows it (e.g. src/index.ts); directories, globs, lists and bare names of files below the root match nothing. Omit fileFilter to search everything.");
+  }
+  if (languageFilter) {
+    filters.push(`languageFilter "${languageFilter}"`);
+    hints.push("languageFilter takes a language label exactly as a result header shows it in brackets (e.g. typescript, python, go), not an alias such as ts or py.");
+  }
+  if (indexing) hints.push("Indexing is in progress, so matching files may not be indexed yet; codebase_status shows progress.");
+  if (!singleSource) return [`No results found for "${query}" in the selected sources with ${filters.join(" and ")}.`, ...hints];
+  const miss = filters.length > 1 ? `${filters.join(" and ")} together matched no indexed chunk`
+    : fileFilter ? `${filters[0]} matched no indexed file` : `${filters[0]} matched no indexed chunk`;
+  return [`No results found for "${query}" in project ${resolvedPath}: ${miss}.`, ...hints];
+}
+
 /** Run a query or status request with the selected mode's Git freshness notice. */
 export async function handleQueryTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<string> {
   const projectPath = (args.projectPath as string) || process.cwd();
-  return withGitRefreshNotice(projectPath, () => dispatchQueryTool(name, args));
+  return withGitRefreshNotice(projectPath, async () => {
+    const result = await dispatchQueryTool(name, args);
+    return typeof result === "string" ? result : result.text;
+  });
 }
 
 /** Dispatch search and status requests using the existing project identity and watcher policy. */
 async function dispatchQueryTool(
   name: string,
   args: Record<string, unknown>,
-): Promise<string> {
+): Promise<string | SearchQueryResponse> {
   const projectPath = (args.projectPath as string) || process.cwd();
   const resolvedPath = path.resolve(projectPath);
   const projectId = projectIdFromPath(resolvedPath);
@@ -144,19 +219,73 @@ async function dispatchQueryTool(
   switch (name) {
     case "codebase_search": {
       await ensureQdrantReady();
+      searchStage("qdrant_ready");
 
       const query = args.query as string;
       const limit = (args.limit as number) || SEARCH_DEFAULT_LIMIT;
       const fileFilter = args.fileFilter as string | undefined;
       const languageFilter = args.languageFilter as string | undefined;
       const includeLinked = args.includeLinked as boolean | undefined;
+      const scope = args.scope === "main" || args.scope === "sources" || args.scope === "project"
+        ? args.scope : includeLinked === false ? "main" : "project";
+      const skipped: string[] = [];
+      const incomplete: string[] = [];
+      const searchedSources: string[] = [];
+      const failedSources: Array<{ path: string; error: string }> = [];
+      const response = (text: string, results: SearchResult[] = [], filteredCount = 0, warnings: string[] = []): SearchQueryResponse => {
+        const partial = skipped.length > 0 || incomplete.length > 0 || failedSources.length > 0;
+        const failed = searchedSources.length === 0 && (failedSources.length > 0 || skipped.length > 0);
+        return { text, isError: failed, structuredContent: {
+          status: failed ? "failed" : partial ? "partial" : allResults.length > 0 ? "ok" : "empty",
+          partial, searchedSources, failedSources, skippedSources: skipped, incompleteSources: incomplete,
+          results, filteredCount, warnings,
+        } };
+      };
 
       let allResults: SearchResult[];
-      if (includeLinked) {
-        const collections = resolveLinkedCollections(resolvedPath);
-        allResults = await searchMultipleCollections(collections, query, limit, fileFilter, languageFilter);
+      if (scope === "main") {
+        const info = await getCollectionInfo(collection);
+        if (!info) return {
+          text: `No codebase index found for: ${resolvedPath}. Run codebase_index for this project when indexing is intended.`,
+          isError: true,
+          structuredContent: { status: "index_missing", partial: false, searchedSources: [], failedSources: [],
+            skippedSources: [`${resolvedPath}: missing`], incompleteSources: [], results: [], filteredCount: 0, warnings: [] },
+        };
+        const metadata = await getProjectMetadata(collection);
+        if (metadata?.indexingStatus === "in-progress") incomplete.push(resolvedPath);
+        try {
+          allResults = await searchChunks(collection, query, limit, fileFilter, languageFilter);
+          searchedSources.push(resolvedPath);
+        } catch (error) {
+          allResults = [];
+          failedSources.push({ path: resolvedPath, error: error instanceof Error ? error.message : String(error) });
+        }
       } else {
-        allResults = await searchChunks(collection, query, limit, fileFilter, languageFilter);
+        const catalog = await getProjectCatalog({ projectPath: resolvedPath });
+        const entries = [...(scope === "project" && catalog.project ? [catalog.project] : []), ...catalog.sources];
+        const selected = entries.filter((entry) => {
+          if ((entry.index === "available" || entry.index === "incomplete") && entry.collection) {
+            if (entry.index === "incomplete") incomplete.push(entry.path);
+            return true;
+          }
+          skipped.push(`${entry.path}: ${entry.index}`);
+          return false;
+        });
+        const collections = selected.flatMap((entry) => entry.collection ? [{ name: entry.collection, label: entry.path }] : []);
+        if (scope === "project" && collections.length === 1 && selected[0] === catalog.project) {
+          try {
+            allResults = await searchChunks(collections[0].name, query, limit, fileFilter, languageFilter);
+            searchedSources.push(resolvedPath);
+          } catch (error) {
+            allResults = [];
+            failedSources.push({ path: resolvedPath, error: error instanceof Error ? error.message : String(error) });
+          }
+        } else {
+          const report = await searchMultipleCollections(collections, query, limit, fileFilter, languageFilter);
+          allResults = report.results;
+          searchedSources.push(...report.searchedSources);
+          failedSources.push(...report.failedSources);
+        }
       }
 
       // Apply minimum score threshold
@@ -168,22 +297,37 @@ async function dispatchQueryTool(
 
       if (results.length === 0) {
         const lines: string[] = [];
-        if (filteredCount > 0) {
+        if (searchedSources.length === 0 && failedSources.length > 0) {
+          lines.push("Search failed: no selected source could be queried. This is not an empty search result.");
+        } else if (searchedSources.length === 0 && skipped.length > 0) {
+          lines.push("No searchable index is available in the selected scope. This is not an empty search result.");
+        } else if (filteredCount > 0) {
           lines.push(
             `No results above score threshold ${minScore.toFixed(2)} for "${query}" in project ${resolvedPath}.`,
             `${filteredCount} result${filteredCount === 1 ? " was" : "s were"} below the threshold. Try a broader query or lower the minScore parameter.`,
           );
+        } else if (fileFilter || languageFilter) {
+          const singleSource = scope !== "sources" && searchedSources.length === 1 && searchedSources[0] === resolvedPath
+            && skipped.length === 0 && failedSources.length === 0;
+          lines.push(...await filteredNoResultsLines(query, resolvedPath, collection, fileFilter, languageFilter, singleSource));
         } else {
           lines.push(
             `No results found for "${query}" in project ${resolvedPath}.`,
-            "Make sure the project has been indexed first using codebase_index.",
           );
         }
         await appendWatcherState(lines, resolvedPath, watcherMode, "search");
-        return lines.join("\n");
+        if (incomplete.length > 0) lines.push(`Incomplete snapshot: ${incomplete.join("; ")}. Previously stored chunks remain searchable during updates; check codebase_status.`);
+        if (skipped.length > 0) lines.push(`Not searched: ${skipped.join("; ")}. Use codebase_status for the relevant path.`);
+        if (failedSources.length > 0) lines.push("Partial search: failed sources are not covered.", ...failedSources.map((item) => `Failed source: ${item.path}: ${item.error}`));
+        const result = response(lines.join("\n"), [], filteredCount, fileFilter || languageFilter ? lines : lines.slice(1));
+        if (!result.structuredContent.partial) result.structuredContent.status = "empty";
+        return result;
       }
 
       const lines = [`Search results for "${query}" (${results.length} matches):\n`];
+      if (incomplete.length > 0) lines.push(`Incomplete snapshot: ${incomplete.join("; ")}. Previously stored chunks remain searchable during updates; check codebase_status.`);
+      if (skipped.length > 0) lines.push(`Not searched: ${skipped.join("; ")}. Use codebase_status for the relevant path.`);
+      if (failedSources.length > 0) lines.push("Partial search: failed sources are not covered.", ...failedSources.map((item) => `Failed source: ${item.path}: ${item.error}`));
 
       if (isIndexingInProgress(resolvedPath)) {
         const progress = getIndexingProgress(resolvedPath);
@@ -212,7 +356,7 @@ async function dispatchQueryTool(
         lines.push(`(${filteredCount} additional result${filteredCount === 1 ? "" : "s"} below score threshold ${minScore.toFixed(2)} omitted)`);
       }
 
-      return lines.join("\n");
+      return response(lines.join("\n"), results, filteredCount, lines.slice(1, lines.findIndex((line) => line.startsWith("--- "))));
     }
 
     case "codebase_status": {
@@ -319,6 +463,8 @@ async function dispatchQueryTool(
         );
       }
 
+      if (metadata?.scanFailure) statusLines.push("Index scan failed: " + metadata.scanFailure);
+
       // Detect persisted incomplete index (previous run was interrupted)
       if (metadata?.indexingStatus === "in-progress" && !isIndexingInProgress(resolvedPath)) {
         // Check if another process is actively indexing (cross-process lock)
@@ -366,7 +512,10 @@ async function dispatchQueryTool(
           statusLines.push("");
           const ago = ((Date.now() - completed.completedAt) / 1000).toFixed(0);
           const duration = (completed.durationMs / 1000).toFixed(1);
-          if (completed.error) {
+          if (completed.error === "Cancelled by user") {
+            statusLines.push(`Last operation: ${completed.type === "full-index" ? "Full index" : "Incremental update"} — cancelled`);
+            statusLines.push(`  Saved progress is preserved; ${ago}s ago (ran for ${duration}s)`);
+          } else if (completed.error) {
             statusLines.push(`Last operation: ${completed.type === "full-index" ? "Full index" : "Incremental update"} — FAILED`);
             statusLines.push(`  Error: ${completed.error}`);
             statusLines.push(`  ${ago}s ago (ran for ${duration}s)`);

@@ -29,11 +29,14 @@ import {
 } from "./chunk-split.js";
 import { ensureDynamicLanguages, gdscriptParserAvailable, getAstGrepLang, rebuildGraph, removeGraph, shouldRebuildGraph } from "./code-graph.js";
 import { ensureArtifactsIndexed, loadConfig, removeAllArtifacts } from "./context-artifacts.js";
+import { ensureQdrantReady } from "./docker.js";
 import { analyzeElixirTemplate, ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir-templates.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import type { GitRefreshTarget } from "./git-state.js";
-import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import { runWithIdleActivity } from "./idle-lifecycle.js";
+import { createGlobIgnore, createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import { assertIndexBudget } from "./index-budget.js";
 import {
   CURRENT_INDEX_FORMAT_VERSION,
   documentTextProfile,
@@ -982,6 +985,7 @@ export async function getIndexableFiles(
 
   const allFiles = await glob("**/*", {
     cwd: projectPath,
+    ignore: createGlobIgnore(ig, projectPath),
     nodir: true,
     dot: (process.env.INCLUDE_DOT_FILES ?? "false").toLowerCase() === "true",
     absolute: false,
@@ -1034,6 +1038,18 @@ async function reclamationRefusal(resolvedPath: string, projectId: string): Prom
 
 /** Full index of a project directory */
 export async function indexProject(
+  projectPath: string,
+  onProgress?: (message: string) => void,
+  extraExtensions?: Set<string>,
+  target?: GitRefreshTarget,
+): Promise<{ filesIndexed: number; chunksCreated: number; cancelled: boolean; skipped?: string }> {
+  return runWithIdleActivity(async () => {
+    await ensureQdrantReady();
+    return indexProjectImpl(projectPath, onProgress, extraExtensions, target);
+  });
+}
+
+async function indexProjectImpl(
   projectPath: string,
   onProgress?: (message: string) => void,
   extraExtensions?: Set<string>,
@@ -1194,6 +1210,7 @@ async function indexProjectLocked(
     await ensureElixirTemplateParsers();
   }
   progress.filesTotal = files.length;
+  assertIndexBudget(files.length, 0, 0);
   onProgress?.(`Found ${files.length} indexable files`);
 
   interface ChunkedFile {
@@ -1206,6 +1223,7 @@ async function indexProjectLocked(
   const chunkedFiles: ChunkedFile[] = [];
   const oversizedFiles = new Set<string>();
   let skippedCount = 0;
+  const scanFailures: string[] = [];
 
   for (let i = 0; i < files.length; i += FILE_SCAN_BATCH) {
     const batch = files.slice(i, i + FILE_SCAN_BATCH);
@@ -1233,7 +1251,8 @@ async function indexProjectLocked(
             indexFormatVersion: effectiveProfile.indexFormatVersion,
           });
           return { relativePath, absolutePath, contentHash, chunks };
-        } catch {
+        } catch (error: unknown) {
+          scanFailures.push(relativePath + ": " + (error instanceof Error ? error.message : String(error)));
           return null;
         }
       }),
@@ -1247,16 +1266,16 @@ async function indexProjectLocked(
   }
 
   await target?.assertCurrent();
+  if (scanFailures.length) {
+    const failure = "Cannot read or chunk " + scanFailures.length + " file(s): " + scanFailures.slice(0, 10).join("; ");
+    await saveProjectMetadata(collection, resolvedPath, files.length, hashes.size, hashes, "in-progress", effectiveProfile, failure);
+    throw new Error(failure);
+  }
+  assertIndexBudget(files.length, chunkedFiles.reduce((n, file) => n + file.chunks.length, 0),
+    chunkedFiles.reduce((n, file) => n + file.chunks.reduce((size, chunk) => size + Buffer.byteLength(chunk.content, "utf8"), 0), 0));
+
   if (hasExistingData) {
     onProgress?.(`${chunkedFiles.length} files changed, ${skippedCount} unchanged/skipped`);
-
-    // Delete old chunks for changed files
-    progress.phase = "cleaning stale chunks";
-    for (const file of chunkedFiles) {
-      if (hashes.has(file.relativePath)) {
-        await deleteFileChunks(collection, file.relativePath, Boolean(target));
-      }
-    }
 
     // Handle deleted files
     const currentFileSet = new Set(
@@ -1315,6 +1334,7 @@ async function indexProjectLocked(
 
     if (batchChunkData.length === 0) {
       for (const file of fileBatch) {
+        await deleteFileChunks(collection, file.relativePath, true);
         hashes.set(file.relativePath, file.contentHash);
       }
       progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
@@ -1342,8 +1362,14 @@ async function indexProjectLocked(
     const batchEmbeddings = await withEffectiveEmbedding(effectiveProfile, () =>
       generateEmbeddings(batchTexts, (processed) => {
         progress.chunksProcessed = globalChunksProcessed + processed;
-      }),
+      }, () => isCancellationRequested(resolvedPath)),
     );
+    if (isCancellationRequested(resolvedPath)) {
+      lastCompleted.set(resolvedPath, { type: "full-index", completedAt: Date.now(),
+        durationMs: Date.now() - progress.startedAt, filesProcessed: hashes.size,
+        chunksCreated: totalChunksCreated, error: "Cancelled by user" });
+      return { filesIndexed: hashes.size, chunksCreated: totalChunksCreated, cancelled: true };
+    }
     globalChunksProcessed += batchChunkData.length;
 
     // Upsert this batch to Qdrant
@@ -1367,7 +1393,7 @@ async function indexProjectLocked(
     // Throws if any point failed after the per-point fallback, so hashes below
     // are only advanced for a batch that landed in full.
     await target?.assertCurrent();
-    await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
+    await upsertPreEmbeddedChunks(collection, batchPoints, true).catch((err) => {
       // Enrich the error with batch context for debugging
       const fileList = fileBatch.map((f) => f.relativePath).join(", ");
       const msg = err instanceof Error ? err.message : String(err);
@@ -1377,6 +1403,12 @@ async function indexProjectLocked(
         `Files in batch: ${fileList}`
       );
     });
+
+    // Прежние фрагменты удаляются после записи новых, включая повторный запуск индексации.
+    for (const file of fileBatch) {
+      await target?.assertCurrent();
+      await deleteFileChunks(collection, file.relativePath, true, file.chunks.map((chunk) => chunk.id));
+    }
 
     // Update hashes for this batch's files
     for (const file of fileBatch) {
@@ -1572,6 +1604,18 @@ export async function updateProjectIndex(
   extraExtensions?: Set<string>,
   target?: GitRefreshTarget,
 ): Promise<{ added: number; updated: number; removed: number; chunksCreated: number; cancelled: boolean; skipped?: string }> {
+  return runWithIdleActivity(async () => {
+    await ensureQdrantReady();
+    return updateProjectIndexImpl(projectPath, onProgress, extraExtensions, target);
+  });
+}
+
+async function updateProjectIndexImpl(
+  projectPath: string,
+  onProgress?: (message: string) => void,
+  extraExtensions?: Set<string>,
+  target?: GitRefreshTarget,
+): Promise<{ added: number; updated: number; removed: number; chunksCreated: number; cancelled: boolean; skipped?: string }> {
   ensureDynamicLanguages();
 
   const resolvedPath = path.resolve(projectPath);
@@ -1595,7 +1639,8 @@ export async function updateProjectIndex(
     const msg = "Another process is already indexing this project, skipping";
     logger.info(msg, { projectPath: resolvedPath });
     onProgress?.(msg);
-    return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false, ...(target ? { skipped: msg } : {}) };
+    // Конкурирующий процесс не выполнил обновление: это должно быть видно в ответе MCP.
+    return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false, skipped: msg };
   }
 
   const progress: IndexingProgress = {
@@ -1698,6 +1743,7 @@ export async function updateProjectIndex(
     await ensureElixirTemplateParsers();
   }
   progress.filesTotal = currentFiles.length;
+  assertIndexBudget(currentFiles.length, 0, 0);
   onProgress?.(`Found ${currentFiles.length} indexable files, scanning for changes...`);
 
   interface ChangedFile {
@@ -1715,6 +1761,7 @@ export async function updateProjectIndex(
   // except the code graph's rebuild gate, which would otherwise take that
   // stale hash as proof the file is unchanged while a rebuild would drop it.
   const unreadableFiles = new Set<string>();
+  const scanFailures: string[] = [];
 
   for (let i = 0; i < currentFiles.length; i += FILE_SCAN_BATCH) {
     const batch = currentFiles.slice(i, i + FILE_SCAN_BATCH);
@@ -1742,7 +1789,8 @@ export async function updateProjectIndex(
             indexFormatVersion: effectiveProfile.indexFormatVersion,
           });
           return { relativePath, absolutePath, contentHash, chunks, isNew: !existingHash };
-        } catch {
+        } catch (error: unknown) {
+          scanFailures.push(relativePath + ": " + (error instanceof Error ? error.message : String(error)));
           // Only a stat or read that failed counts: a file that was read and
           // then failed to chunk is not unreadable, and marking it so would
           // rebuild the graph on every run for as long as it stayed that way.
@@ -1756,6 +1804,14 @@ export async function updateProjectIndex(
     progress.filesProcessed = Math.min(i + batch.length, currentFiles.length);
   }
 
+  if (scanFailures.length) {
+    const failure = "Cannot read or chunk " + scanFailures.length + " file(s): " + scanFailures.slice(0, 10).join("; ");
+    await target?.assertCurrent();
+    await saveProjectMetadata(collection, resolvedPath, currentFiles.length, hashes.size, hashes, "in-progress", effectiveProfile, failure);
+    throw new Error(failure);
+  }
+  assertIndexBudget(currentFiles.length, changedFiles.reduce((n, file) => n + file.chunks.length, 0),
+    changedFiles.reduce((n, file) => n + file.chunks.reduce((size, chunk) => size + Buffer.byteLength(chunk.content, "utf8"), 0), 0));
   const unchangedCount = currentFiles.length - changedFiles.length;
   onProgress?.(`${changedFiles.length} files changed, ${unchangedCount} unchanged/skipped`);
   const currentFileSet = new Set(
@@ -1769,13 +1825,6 @@ export async function updateProjectIndex(
 
   if (changedFiles.length > 0) {
     await target?.assertCurrent();
-    // Delete old chunks for updated (not new) files
-    progress.phase = "cleaning stale chunks";
-    for (const file of changedFiles) {
-      if (!file.isNew) {
-        await deleteFileChunks(collection, file.relativePath, Boolean(target));
-      }
-    }
 
     // ── Phase 2 & 3: Process changed files in batches (embed → upsert → checkpoint) ──
     const totalBatches = Math.ceil(changedFiles.length / INDEX_BATCH_SIZE) || 1;
@@ -1820,6 +1869,7 @@ export async function updateProjectIndex(
 
       if (batchChunkData.length === 0) {
         for (const file of fileBatch) {
+          await deleteFileChunks(collection, file.relativePath, true);
           hashes.set(file.relativePath, file.contentHash);
           if (file.isNew) added++;
           else updated++;
@@ -1849,8 +1899,14 @@ export async function updateProjectIndex(
       const batchEmbeddings = await withEffectiveEmbedding(effectiveProfile, () =>
         generateEmbeddings(batchTexts, (processed) => {
           progress.chunksProcessed = globalChunksProcessed + processed;
-        }),
+        }, () => isCancellationRequested(resolvedPath)),
       );
+      if (isCancellationRequested(resolvedPath)) {
+        lastCompleted.set(resolvedPath, { type: "incremental-update", completedAt: Date.now(),
+          durationMs: Date.now() - progress.startedAt, filesProcessed: added + updated,
+          chunksCreated, error: "Cancelled by user" });
+        return { added, updated, removed, chunksCreated, cancelled: true };
+      }
       globalChunksProcessed += batchChunkData.length;
 
       // Upsert this batch to Qdrant
@@ -1874,7 +1930,12 @@ export async function updateProjectIndex(
       // Throws if any point failed after the per-point fallback, so hashes below
       // are only advanced for a batch that landed in full.
       await target?.assertCurrent();
-      await upsertPreEmbeddedChunks(collection, batchPoints);
+      // Сначала дожидаемся записи новых точек; при ошибке прежние не удаляются.
+      await upsertPreEmbeddedChunks(collection, batchPoints, true);
+      for (const file of fileBatch) {
+        await target?.assertCurrent();
+        await deleteFileChunks(collection, file.relativePath, true, file.chunks.map((chunk) => chunk.id));
+      }
 
       // Update hashes and counts for this batch's files
       for (const file of fileBatch) {

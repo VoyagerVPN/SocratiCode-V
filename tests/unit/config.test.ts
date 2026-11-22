@@ -532,10 +532,10 @@ describe("config", () => {
 
   /** Create a temporary git repo with a named branch and initial commit. */
   function initTempRepo(tmpDir: string, branch: string): void {
-    execFileSync("git", ["init", "-b", branch, tmpDir]);
-    execFileSync("git", ["config", "user.name", "test"], { cwd: tmpDir });
-    execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: tmpDir });
-    execFileSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: tmpDir });
+    execFileSync("git", ["init", "-b", branch, tmpDir], { windowsHide: true, shell: false });
+    execFileSync("git", ["config", "user.name", "test"], { cwd: tmpDir, windowsHide: true, shell: false });
+    execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: tmpDir, windowsHide: true, shell: false });
+    execFileSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: tmpDir, windowsHide: true, shell: false });
   }
 
   describe("detectGitBranch", () => {
@@ -553,6 +553,8 @@ describe("config", () => {
     it("returns null for non-git directories", () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-nogit-"));
       try {
+        // Невалидный gitdir останавливает поиск репозитория предка при TEMP внутри .cache.
+        fs.writeFileSync(path.join(tmpDir, ".git"), "gitdir: ./missing-repository\n");
         expect(detectGitBranch(tmpDir)).toBeNull();
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -709,12 +711,12 @@ describe("config", () => {
       // that branch-aware mode is suppressed by an explicit projectId.
       // Disable gpg/ssh signing locally so the test is robust against the
       // user's global git config (commit.gpgsign=true is common).
-      execFileSync("git", ["init", "-b", "feature-branch", projectDir]);
-      execFileSync("git", ["config", "user.name", "test"], { cwd: projectDir });
-      execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: projectDir });
-      execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: projectDir });
-      execFileSync("git", ["config", "tag.gpgsign", "false"], { cwd: projectDir });
-      execFileSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: projectDir });
+      execFileSync("git", ["init", "-b", "feature-branch", projectDir], { windowsHide: true, shell: false });
+      execFileSync("git", ["config", "user.name", "test"], { cwd: projectDir, windowsHide: true, shell: false });
+      execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: projectDir, windowsHide: true, shell: false });
+      execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: projectDir, windowsHide: true, shell: false });
+      execFileSync("git", ["config", "tag.gpgsign", "false"], { cwd: projectDir, windowsHide: true, shell: false });
+      execFileSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: projectDir, windowsHide: true, shell: false });
 
       const id = projectIdFromPath(projectDir);
       expect(id).toBe("stable-id");

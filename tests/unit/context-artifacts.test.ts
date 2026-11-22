@@ -517,7 +517,8 @@ describe("readArtifactContent — directory exclusions", () => {
     await writeBytes(projectDir, "versions/payload.bin", PYC_BYTES);
 
     const { exclusions } = await readArtifactContent("./versions", projectDir);
-    expect(exclusions).toEqual({ ignored: 1, binary: 1, unreadable: 0 });
+    // Обрезанная до обхода папка coverage больше не перечисляет свои файлы.
+    expect(exclusions).toEqual({ ignored: 0, binary: 1, unreadable: 0 });
   });
 
   // Creating a symlink on Windows needs developer mode or elevation; CI is

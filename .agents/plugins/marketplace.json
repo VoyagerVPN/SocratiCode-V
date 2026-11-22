@@ -1,0 +1,20 @@
+{
+  "name": "socraticode-local",
+  "plugins": [
+    {
+      "name": "socraticode",
+      "policy": {
+        "authentication": "ON_INSTALL",
+        "installation": "AVAILABLE"
+      },
+      "category": "Development",
+      "source": {
+        "path": "./plugins/socraticode",
+        "source": "local"
+      }
+    }
+  ],
+  "interface": {
+    "displayName": "SocratiCode V"
+  }
+}

@@ -1,6 +1,12 @@
 node_modules/
 dist/
 *.tsbuildinfo
+.cache/
+.temp/
+.lab/
+.research/
+%SystemDrive%/
+.tgrep/
 
 # OS files
 .DS_Store

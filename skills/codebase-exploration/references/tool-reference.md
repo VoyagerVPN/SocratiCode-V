@@ -9,8 +9,8 @@ Semantic search across an indexed codebase. Only use after `codebase_index` is c
 | `query` | string | yes | — | Natural language search query (e.g. "authentication middleware", "database connection setup") |
 | `projectPath` | string | no | cwd | Absolute path to the project directory |
 | `limit` | number (1-50) | no | 10 | Maximum results. Override globally via `SEARCH_DEFAULT_LIMIT` env var |
-| `fileFilter` | string | no | — | Filter results to a specific file path (relative) |
-| `languageFilter` | string | no | — | Filter results to a specific language (e.g. "typescript", "python") |
+| `fileFilter` | string | no | — | One exact relative file path from a result; directories/globs do not match |
+| `languageFilter` | string | no | — | One exact language label (e.g. "typescript", "python"); aliases do not match |
 | `minScore` | number (0-1) | no | 0.10 | Minimum RRF score threshold. Override via `SEARCH_MIN_SCORE`. Set to 0 to disable |
 
 **Returns:** Ranked code chunks with file paths, line numbers, language, and RRF scores.
@@ -201,3 +201,9 @@ Display information about SocratiCode and all its tools.
 - Stale artifacts are auto-detected and re-indexed when content changes
 - Use `artifactName` filter to target specific schemas or specs
 - Supported types: SQL schemas, OpenAPI/Protobuf specs, Terraform configs, K8s manifests, architecture docs, env configs — any text-based file
+
+### Перенесённые обновления upstream
+
+`limit` в `codebase_symbol` ограничивает число разрешаемых определений с одинаковым именем. В `codebase_impact` и `codebase_flow` он ограничивает список неоднозначных кандидатов, а не глубину или размер дерева вызовов. Положительное целое число; без параметра возвращаются все определения/кандидаты. Ответ сообщает полное число совпадений.
+
+`fileFilter` принимает один точный относительный путь из результата, без каталогов и glob; `languageFilter` принимает точное имя языка (`typescript`, `python`), без сокращений `ts` и `py`.

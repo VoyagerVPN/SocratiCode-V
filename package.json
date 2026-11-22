@@ -1,29 +1,29 @@
 {
   "name": "socraticode",
   "mcpName": "io.github.giancarloerra/socraticode",
-  "version": "1.16.0",
+  "version": "1.16.1-local.9",
   "description": "SocratiCode — MCP server for local codebase indexing, semantic search, and code dependency graphs. All private, all local via Docker.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "socraticode": "dist/index.js"
+    "socraticode": "dist/launcher.js"
   },
   "scripts": {
     "build": "tsc && node scripts/copy-assets.mjs",
     "check:release-versions": "node scripts/check-release-versions.mjs",
-    "start": "node dist/index.js",
+    "start": "node dist/launcher.js",
     "dev": "tsx src/index.ts",
     "lint": "biome check src/ tests/",
     "lint:fix": "biome check --write src/ tests/",
     "release": "release-it",
     "prepublishOnly": "tsc && node scripts/copy-assets.mjs",
     "release:dry": "release-it --dry-run",
-    "test": "vitest run",
-    "test:unit": "vitest run tests/unit/",
-    "test:integration": "vitest run tests/integration/",
-    "test:e2e": "vitest run tests/e2e/",
-    "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run",
+    "test:unit": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run tests/unit/",
+    "test:integration": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run tests/integration/",
+    "test:e2e": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run tests/e2e/",
+    "test:watch": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs",
+    "test:coverage": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run --coverage"
   },
   "keywords": [
     "mcp",
@@ -43,12 +43,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/giancarloerra/socraticode.git"
+    "url": "https://github.com/VoyagerVPN/SocratiCode-V.git"
   },
   "bugs": {
-    "url": "https://github.com/giancarloerra/socraticode/issues"
+    "url": "https://github.com/VoyagerVPN/SocratiCode-V/issues"
   },
-  "homepage": "https://socraticode.cloud",
+  "homepage": "https://github.com/VoyagerVPN/SocratiCode-V",
   "license": "AGPL-3.0-only",
   "files": [
     "dist",
@@ -85,36 +85,39 @@
     "@hono/node-server": "~1.19.15",
     "@lumis-sh/wasm-eex": "^0.26.1",
     "@lumis-sh/wasm-heex": "^0.26.2",
-    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@modelcontextprotocol/node": "2.1.1",
+    "@modelcontextprotocol/server": "2.3.1",
     "@parcel/watcher": "^2.5.6",
     "@qdrant/js-client-rest": "~1.18.0",
     "glob": "^10.5.0",
     "ignore": "^7.0.3",
-    "ollama": "^0.5.14",
+    "ollama": "0.6.3",
     "open": "^10.2.0",
     "openai": "^6.22.0",
     "proper-lockfile": "^4.1.2",
     "smol-toml": "^1.8.0",
+    "typescript": "^5.7.3",
     "undici": "^6.28.0",
     "web-tree-sitter": "^0.26.12",
-    "zod": "^3.24.2"
+    "yaml": "^2.9.1",
+    "zod": "4.3.6"
   },
   "optionalDependencies": {
     "tree-sitter-gdscript": "6.1.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4",
+    "@modelcontextprotocol/client": "2.3.1",
     "@release-it/conventional-changelog": "^11.0.0",
     "@types/node": "^22.13.4",
     "@types/proper-lockfile": "^4.1.4",
     "@vitest/coverage-v8": "^4.1.11",
     "release-it": "^20.0.1",
     "tsx": "^4.19.4",
-    "typescript": "^5.7.3",
     "vitest": "^4.1.11"
   },
   "engines": {
-    "node": ">=18.17.0"
+    "node": ">=20"
   },
   "overrides": {
     "vitest": {

@@ -8,6 +8,8 @@
  * - provider implementations import these types
  */
 
+import type { InfraProgressCallback } from "./docker.js";
+
 // ── Interface ────────────────────────────────────────────────────────────
 
 export interface EmbeddingProvider {
@@ -21,7 +23,7 @@ export interface EmbeddingProvider {
    *
    * Returns a bag of status flags for the tools layer.
    */
-  ensureReady(): Promise<EmbeddingReadinessResult>;
+  ensureReady(onProgress?: InfraProgressCallback): Promise<EmbeddingReadinessResult>;
 
   /** Generate embeddings for one or more texts. */
   embed(texts: string[]): Promise<number[][]>;
