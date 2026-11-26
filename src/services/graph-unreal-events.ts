@@ -3,7 +3,10 @@ import type { SgNode } from "@ast-grep/napi";
 import type { SymbolEdge, SymbolNode } from "../types.js";
 import { type cppBindings, cppIndex, cppProject } from "./graph-cpp.js";
 
+import { connectFeatureSites, type FeatureSite } from "./graph-unreal-features.js";
+
 type Evidence =
+  | { kind: "feature"; feature: FeatureSite["evidence"] }
   | { kind: "launch"; body: SymbolNode; slot?: string; object?: string; binding?: number }
   | { kind: "store"; object: string; collection: string }
   | { kind: "read"; slot: string; collection?: string; binding?: number }
@@ -104,7 +107,11 @@ export function containerEvidence(node: SgNode, lookup: Lookup): Evidence | unde
   if (path.length) return { kind: "container", op, path };
 }
 
-export function connectUnrealSites(sites: UnrealSite[], files: Map<string, SymbolNode[]>, edges: Map<string, SymbolEdge[]>) {
+export function connectUnrealSites(sites: UnrealSite[], files: Map<string, SymbolNode[]>, edges: Map<string, SymbolEdge[]>, domains?: Map<string, string>) {
+  if (!sites.length) return;
+  connectFeatureSites(sites.flatMap(s => s.evidence.kind === "feature" ? [{ ...s, evidence: s.evidence.feature }] : []),
+    files, edges, file => domains?.get(file) ?? cppProject(file));
+  sites = sites.filter(s => s.evidence.kind !== "feature");
   if (!sites.length) return;
   const index = cppIndex(files);
   function connect(site: UnrealSite, target: SymbolNode, label: string, kind: "event" | "data_flow" = "event") {

@@ -24,6 +24,9 @@ export interface CodeGraphNode {
    */
   language?: string;
   /** Точные результаты разрешения импортов в данном файле. */
+  unrealDomain?: string;
+  unrealModule?: string;
+  unrealRelations?: Record<string, string>;
   importTargets?: Record<string, string>;
   importScopes?: Record<string, SymbolTargetScope>;
   imports: string[];
@@ -133,6 +136,7 @@ export interface SymbolNode {
   id: string;
   /** Класс-владелец определения C++ и тип сетевого объявления UHT. */
   cppOwner?: string;
+  cppBases?: string[];
   cppFields?: Record<string, string>;
   cppDelegateTypes?: string[];
   unrealRpc?: "Server" | "Client" | "NetMulticast" | "Remote";

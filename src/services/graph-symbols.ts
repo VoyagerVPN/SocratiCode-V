@@ -14,6 +14,7 @@ import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templ
 import { cppBindings, cppCallback, cppClassFields, cppDelegateTypes, cppType, unrealInputMappings } from "./graph-cpp.js";
 import { phpFoldCase } from "./graph-php-case.js";
 import { containerEvidence, launchEvidence, launchedLambda, replicationEvidence, taskEvidence, type UnrealSite } from "./graph-unreal-events.js";
+import { featureEvidence } from "./graph-unreal-features.js";
 import { logger } from "./logger.js";
 import { gdscriptParserAvailable } from "./parser-availability.js";
 
@@ -3197,6 +3198,9 @@ function extractFromCFamily(
           file, line: startLine, endLine, language,
         };
         sym.cppFields = cppClassFields(cls);
+        const bases = cls.children().find((n: SgNode) => n.kind() === "base_class_clause")?.children()
+          .filter((n: SgNode) => ["type_identifier", "qualified_identifier"].includes(String(n.kind()))).map((n: SgNode) => n.text().split("::").pop());
+        if (bases?.length) sym.cppBases = bases;
         symbols.push(sym);
         scopes.push({ name, startLine, endLine, symbolId: sym.id });
       }
@@ -3241,6 +3245,8 @@ function extractFromCFamily(
     const callerId = outer?.id ?? findCallerId(scopes, node.range().start.line + 1, moduleSym.id);
     const caller = outer ?? callers.get(callerId);
     if (binding && caller) {
+      const feature = featureEvidence(node, binding);
+      if (feature) unrealSites.push({ symbol: caller, line: node.range().start.line + 1, evidence: { kind: "feature", feature } });
       const lambda = launchedLambda(node);
       if (lambda?.kind() === "lambda_expression") {
         const r = lambda.range();

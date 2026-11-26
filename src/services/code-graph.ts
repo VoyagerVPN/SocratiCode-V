@@ -47,6 +47,7 @@ import {
 } from "./graph-symbols.js";
 import { createTypeScriptResolver } from "./graph-typescript.js";
 import { connectUnrealSites, type UnrealSite } from "./graph-unreal-events.js";
+import { isUnrealDescriptor, isUnrealRule, linkUnrealModules } from "./graph-unreal-modules.js";
 
 import { createIgnoreFilter } from "./ignore.js";
 import { logger } from "./logger.js";
@@ -472,7 +473,8 @@ async function doRebuildGraph(
           built.godotContext,
         );
 
-        connectUnrealSites(built.unrealSites, built.symbolsByFile, built.outgoingCallsByFile);
+        connectUnrealSites(built.unrealSites, built.symbolsByFile, built.outgoingCallsByFile,
+          new Map(graph.nodes.flatMap(n => n.unrealDomain ? [[n.relativePath, n.unrealDomain] as const] : [])));
         progress.phase = "persisting symbols";
         await persistSymbolGraph(projectId, resolvedPath, built.symbolsByFile, built.outgoingCallsByFile);
       } catch (err) {
@@ -1158,7 +1160,7 @@ export async function getGraphableFiles(
         // resolution. They are not graph nodes themselves, but they must
         // be in the file set so buildGodotUidIndexes can read them.
         const isGodotUid = ext === ".uid";
-        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext) || isGodotResource || isGodotUid || isInputConfig(relPath)) {
+        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext) || isGodotResource || isGodotUid || isInputConfig(relPath) || isUnrealDescriptor(relPath)) {
           files.push(relPath);
         } else if (ext === "" && (includeDotFiles || !entry.name.startsWith("."))) {
           // Extensionless: admit only when detection yields a grammar-bearing
@@ -1321,6 +1323,7 @@ export async function buildCodeGraph(
 
   const classifyJsImport = createJsImportClassifier(resolvedPath, aliases, recorder, files.filter((file) =>
     ["typescript", "javascript", "tsx", "jsx", "svelte", "vue"].includes(getLanguageFromExtension(path.extname(file).toLowerCase()))));
+  const unrealSources = new Map<string, string>();
   const nodesMap = new Map<string, CodeGraphNode>();
   const edges: CodeGraphEdge[] = [];
   const unrealSites: UnrealSite[] = [];
@@ -1524,7 +1527,7 @@ export async function buildCodeGraph(
       if (progress) progress.filesProcessed++;
       continue;
     }
-    if (!lang && !isElixirTemplate && !isGodotResource && !isInputConfig(relPath)) {
+    if (!lang && !isElixirTemplate && !isGodotResource && !isInputConfig(relPath) && !isUnrealDescriptor(relPath)) {
       const absolutePath = path.join(resolvedPath, relPath);
       // A leaf node is made from its path alone — nothing here reads it — so
       // only its presence is recorded. Its content reaching the graph would
@@ -1610,8 +1613,9 @@ export async function buildCodeGraph(
     // as plaintext.
     node.language = language;
 
-    const extractionLang = lang ?? (isInputConfig(relPath) ? "unreal-input" : isGodotResource ? "godot-resource" : "elixir-template");
-    const importInfos = extractionLang === "unreal-input" ? [] : extractImports(source, extractionLang, ext);
+    if (isUnrealRule(relPath) || isUnrealDescriptor(relPath)) unrealSources.set(relPath, source);
+    const extractionLang = lang ?? (isUnrealDescriptor(relPath) ? "unreal-descriptor" : isInputConfig(relPath) ? "unreal-input" : isGodotResource ? "godot-resource" : "elixir-template");
+    const importInfos = (extractionLang === "unreal-input" || extractionLang === "unreal-descriptor") ? [] : extractImports(source, extractionLang, ext);
 
     // Extract symbols & raw call sites in the same pass
     try {
@@ -1763,6 +1767,7 @@ export async function buildCodeGraph(
     if (progress) progress.filesProcessed++;
   }
 
+  linkUnrealModules(unrealSources, nodesMap, edges);
   logger.info("Code graph built", {
     nodes: nodesMap.size,
     edges: edges.length,

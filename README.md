@@ -4,6 +4,8 @@ SocratiCode V is VoyagerVPN’s fork of [SocratiCode](https://github.com/giancar
 
 Several Codex sessions can use one local MCP server. The portable profile pairs Jina v5 Nano Retrieval embeddings with Ollama on an NVIDIA GPU and stores indexes in Qdrant. Compact search results share overlapping source lines and support pagination. C++ graphs can follow Unreal RPCs, delegate bindings, task launches and reads from shared queues.
 
+For an Unreal project, start with `codebase_graph_query` on the `.uproject` or `.uplugin` to see local modules and loading phases. Query a module's `.Build.cs` for declared dependencies and member files, then query a C++ file for resolved headers. For a provider selected through `IModularFeatures`, use `codebase_flow` on the lookup and `codebase_symbol` on the implementation. The graph marks candidates found in source. The running game's loaded modules and registrations determine which implementation executes.
+
 ## Run the Codex plugin
 
 The portable profile targets Windows, Docker Desktop with Linux containers, and an NVIDIA GPU available to Docker. For building and testing, use Node.js 22.22.2 or newer in the 22.x series.

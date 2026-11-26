@@ -199,6 +199,67 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     return { fileGraph, cache };
   }
 
+  it("maps Unreal descriptors and module visibility across independently named projects", async () => {
+    const put = (f: string, source: string) => {
+      const target = path.join(tmpDir, f);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, source);
+    };
+    const game = "Source/Ship/Ship.Build.cs";
+    const lib = "Plugins/Tools/Source/Radio/Radio.Build.cs";
+    const header = "Plugins/Tools/Source/Radio/Public/Signal.h";
+    put("Ocean.uproject", JSON.stringify({ Modules: [{ Name: "Ship", Type: "Runtime" }], Plugins: [{ Name: "Tools", Enabled: true }] }));
+    put("Plugins/Tools/Tools.uplugin", JSON.stringify({ Modules: [{ Name: "Radio", Type: "Editor", LoadingPhase: "PostEngineInit" }] }));
+    put(game, 'class Ship : ModuleRules { Ship() { PrivateDependencyModuleNames.AddRange(new[]{"Radio"}); } }');
+    put(lib, 'class Radio : ModuleRules {}');
+    put(header, "#pragma once");
+    put("Plugins/Tools/Source/Radio/Private/Hidden.h", "#pragma once");
+    put("Source/Ship/Private/Console.cpp", '#include "Signal.h"\n#include "Hidden.h"');
+    put("Other/Other.uproject", '{"Modules":[{"Name":"Radio"}]}');
+    put("Other/Source/Radio/Radio.Build.cs", "class Radio : ModuleRules {}");
+    put("Other/Source/Radio/Public/Signal.h", "#pragma once");
+    const { nodes } = await buildCodeGraph(tmpDir);
+    const deps = (file: string) => nodes.find(n => n.relativePath === file)?.dependencies;
+    expect(deps("Ocean.uproject")).toEqual(expect.arrayContaining([game, "Plugins/Tools/Tools.uplugin"]));
+    expect(deps("Plugins/Tools/Tools.uplugin")).toContain(lib);
+    expect(deps(game)).toContain(lib);
+    expect(deps("Source/Ship/Private/Console.cpp")).toContain(header);
+    expect(deps("Source/Ship/Private/Console.cpp")).not.toContain("Plugins/Tools/Source/Radio/Private/Hidden.h");
+    expect(deps(game)).not.toContain("Other/Source/Radio/Radio.Build.cs");
+  });
+
+  it("traces an Unreal modular feature factory and its product through a task", async () => {
+    fs.writeFileSync(path.join(tmpDir, "Audio.cpp"), [
+      "class ISound { public: virtual void Play() = 0; };",
+      "class Bell : public ISound { public: void Play() override {} };",
+      "class Noise : public ISound { public: void Play() override {} };",
+      "class IOutput { public: static FName Key() { return TEXT(\"Sound\"); } };",
+      "class Device : public IOutput {",
+      "void Start() { IModularFeatures::Get().RegisterModularFeature(Key(),this); }",
+      "TSharedRef<ISound> Open() { return MakeShared<Bell>(); }", "};",
+      "class Spare : public IOutput {",
+      "void Start() { IModularFeatures::Get().RegisterModularFeature(TEXT(\"Music\"),this); }",
+      "TSharedRef<ISound> Open() { return MakeShared<Noise>(); }", "};",
+      "TSharedPtr<ISound> IOutput::Select() {",
+      "const auto choices = IModularFeatures::Get().GetModularFeatureImplementations<IOutput>(Key());",
+      "return choices[0]->Open();", "}",
+      "void PlayLater() { auto sound = IOutput::Select();",
+      "UE::Tasks::Launch(TEXT(\"audio\"), [sound=MoveTemp(sound)]() { sound->Play(); });", "}",
+      "void Rebound() { auto sound = IOutput::Select();",
+      "UE::Tasks::Launch(TEXT(\"other\"), [sound=Different()]() { sound->Play(); });", "}",
+    ].join("\n"));
+    const { cache } = await runPipeline();
+    const contexts = await getSymbolContext(cache, "Open");
+    expect(contexts.find(c => c.symbol.cppOwner === "Device")?.callers.map(c => c.line)).toContain(15);
+    expect(contexts.find(c => c.symbol.cppOwner === "Spare")?.callers.map(c => c.line)).not.toContain(15);
+    const [productType] = await getSymbolContext(cache, "Bell");
+    expect(productType.callers.map(c => c.line)).toContain(7);
+    const products = await getSymbolContext(cache, "Play");
+    expect(products.find(c => c.symbol.cppOwner === "Bell")?.callers.map(c => c.line)).toContain(18);
+    expect(products.find(c => c.symbol.cppOwner === "Bell")?.callers.map(c => c.line)).not.toContain(21);
+    expect(products.find(c => c.symbol.cppOwner === "Noise")?.callers.map(c => c.line)).not.toContain(18);
+  });
+
   it("follows typed C++ pointer calls into inline class methods", async () => {
     fs.writeFileSync(path.join(tmpDir, "Runtime.cpp"), [
       "class Runtime { public:", "void Build(int Queue) {}", "};", "class Other { public: void Build(int Value) {} };",

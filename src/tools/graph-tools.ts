@@ -708,10 +708,15 @@ async function readGraphListPage(name: string, args: Record<string, unknown>): P
         if (!filePath || !graph.nodes.some((node) => toForwardSlash(node.relativePath) === filePath)) {
           throw new Error("File not found in the indexed graph: " + filePath + ". Check the relative path and indexed file coverage.");
         }
+        const nodes = new Map(graph.nodes.map(n => [toForwardSlash(n.relativePath), n]));
         const deps = getFileDependencies(graph, filePath);
+        const owner = nodes.get(filePath)?.unrealModule;
+        const members = /\.Build\.cs$/i.test(filePath) ? graph.nodes.filter(n => n.unrealModule === filePath).map(n => n.relativePath).sort() : [];
         const entries: PageEntry[] = [
-          ...[...new Set(deps.imports.map(toForwardSlash))].sort().map((file) => ({ kind: "import" as const, file })),
-          ...[...new Set(deps.importedBy.map(toForwardSlash))].sort().map((file) => ({ kind: "dependent" as const, file })),
+          ...(owner ? [{ kind: "module" as const, file: owner }] : []),
+          ...[...new Set(deps.imports.map(toForwardSlash))].sort().map((file) => ({ kind: "import" as const, file, relation: nodes.get(filePath)?.unrealRelations?.[file] })),
+          ...[...new Set(deps.importedBy.map(toForwardSlash))].sort().map((file) => ({ kind: "dependent" as const, file, relation: nodes.get(file)?.unrealRelations?.[filePath] })),
+          ...members.map(file => ({ kind: "member" as const, file })),
         ];
         const metadata = await getGraphStatus(projectPath);
         const revision = pageFingerprint({ builtAt: metadata?.lastBuiltAt, entries });

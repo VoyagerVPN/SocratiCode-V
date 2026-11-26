@@ -333,7 +333,7 @@ export const SUPPORTED_EXTENSIONS = new Set([
   // Web
   ".html", ".htm", ".css", ".scss", ".sass", ".less", ".styl", ".vue", ".svelte",
   // Config/Data
-  ".json", ".yaml", ".yml", ".toml", ".xml", ".ini", ".cfg",
+  ".uproject", ".uplugin", ".json", ".yaml", ".yml", ".toml", ".xml", ".ini", ".cfg",
   // Docs
   ".md", ".mdx", ".rst", ".txt",
   // SQL
@@ -414,7 +414,7 @@ const EXTENSION_TO_LANGUAGE: Record<string, string> = {
   ".html": "html", ".htm": "html",
   ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less", ".styl": "stylus",
   ".vue": "vue", ".svelte": "svelte",
-  ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+  ".uproject": "json", ".uplugin": "json", ".json": "json", ".yaml": "yaml", ".yml": "yaml",
   ".toml": "toml", ".xml": "xml",
   ".md": "markdown", ".mdx": "markdown", ".rst": "rst",
   ".sql": "sql",

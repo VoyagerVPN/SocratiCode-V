@@ -7,7 +7,7 @@ const symbolEntrySchema = z.object({
   kind: z.literal("symbol"), id: z.string(), name: z.string(), qualifiedName: z.string(),
   symbolKind: z.string(), file: z.string(), line: z.number().int(), endLine: z.number().int(),
 });
-const dependencyEntrySchema = z.object({ kind: z.enum(["import", "dependent"]), file: z.string() });
+const dependencyEntrySchema = z.object({ kind: z.enum(["import", "dependent", "module", "member"]), file: z.string(), relation: z.string().optional() });
 export const pageEntrySchema = z.union([symbolEntrySchema, dependencyEntrySchema]);
 export type PageEntry = z.infer<typeof pageEntrySchema>;
 const fullPageResultSchema = z.object({
@@ -99,11 +99,11 @@ function presentPage(response: RawPageToolResponse, presentation: Presentation):
   if (response.isError || !page.entries.length) lines.push(response.text);
   else if (page.entries[0].kind !== "symbol") {
     lines.push(inlineLabel(String(presentation.filePath ?? "Dependencies")) + " [" + page.returned + "/" + page.total + "]");
-    for (const kind of ["import", "dependent"] as const) {
+    for (const kind of ["module", "import", "dependent", "member"] as const) {
       const entries = page.entries.filter((entry) => entry.kind === kind);
       if (!entries.length) continue;
-      lines.push(kind === "import" ? "Imports →" : "Dependents ←");
-      for (const entry of entries) lines.push("  " + inlineLabel(entry.file));
+      lines.push({ module: "Unreal module", import: "Imports →", dependent: "Dependents ←", member: "Module files" }[kind]);
+      for (const entry of entries) lines.push("  " + inlineLabel(entry.file) + ("relation" in entry && entry.relation ? " [" + inlineLabel(entry.relation) + "]" : ""));
     }
   } else {
     lines.push("Symbols [" + page.returned + "/" + page.total + "]");
