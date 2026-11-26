@@ -14,7 +14,7 @@ import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templ
 import { cppBindings, cppCallback, cppClassFields, cppDelegateTypes, cppType, unrealInputMappings } from "./graph-cpp.js";
 import { phpFoldCase } from "./graph-php-case.js";
 import { containerEvidence, launchEvidence, launchedLambda, replicationEvidence, taskEvidence, type UnrealSite } from "./graph-unreal-events.js";
-import { featureEvidence } from "./graph-unreal-features.js";
+import { cppValueSource, featureEvidence } from "./graph-unreal-features.js";
 import { logger } from "./logger.js";
 import { gdscriptParserAvailable } from "./parser-availability.js";
 
@@ -3232,6 +3232,7 @@ function extractFromCFamily(
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
   const binding = langKey === "cpp" ? cppBindings(root) : undefined;
+  const valueSource = binding && cppValueSource(root, binding);
   const callers = new Map(symbols.map(sym => [sym.id, sym]));
   const taskBodies = new Map<number, SymbolNode>();
   for (const node of safeFindAll(root, "call_expression")) {
@@ -3245,7 +3246,7 @@ function extractFromCFamily(
     const callerId = outer?.id ?? findCallerId(scopes, node.range().start.line + 1, moduleSym.id);
     const caller = outer ?? callers.get(callerId);
     if (binding && caller) {
-      const feature = featureEvidence(node, binding);
+      const feature = valueSource && featureEvidence(node, valueSource);
       if (feature) unrealSites.push({ symbol: caller, line: node.range().start.line + 1, evidence: { kind: "feature", feature } });
       const lambda = launchedLambda(node);
       if (lambda?.kind() === "lambda_expression") {

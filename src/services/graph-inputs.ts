@@ -435,7 +435,7 @@ export function createGraphInputRecorder(projectRoot: string): GraphInputRecorde
       if (conflicts.size > 0) throw new GraphInputsMovedDuringBuild(new Map(conflicts));
       return {
         version: GRAPH_INPUTS_VERSION,
-        ...([...files.keys()].some(isUnrealModule) ? { unrealRpcVersion: 4 } : {}),
+        ...([...files.keys()].some(isUnrealModule) ? { unrealRpcVersion: 5 } : {}),
         builtByVersion: SOCRATICODE_VERSION,
         capabilities,
         files: sortedRecord(files),
@@ -627,7 +627,7 @@ export async function decideGraphRebuild(
     // however quiet the update was — `graphExists` is what says so.
     return rebuildFor("no usable record of what the graph was built from");
   }
-  if (record.unrealRpcVersion !== 4 && Object.keys(record.files).some(isUnrealModule)) {
+  if (record.unrealRpcVersion !== 5 && Object.keys(record.files).some(isUnrealModule)) {
     return rebuildFor("Unreal module graph predates typed calls and event resolution");
   }
   if (record.capabilities !== capabilities) {

@@ -228,6 +228,32 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     expect(deps(game)).not.toContain("Other/Source/Radio/Radio.Build.cs");
   });
 
+  it("finds nested Unreal module rules within their declaring descriptor and rejects ambiguous names", async () => {
+    const files: Record<string, string> = {
+      "Game.uproject": JSON.stringify({ Modules: [{ Name: "Mixer" }, { Name: "Duplicate" }, { Name: "PluginOnly" }] }),
+      "Source/Media/Audio/Mixer/Mixer.Build.cs": "class Mixer : ModuleRules {}",
+      "Source/A/Duplicate/Duplicate.Build.cs": "class Duplicate : ModuleRules {}",
+      "Source/B/Duplicate/Duplicate.Build.cs": "class Duplicate : ModuleRules {}",
+      "Plugins/Studio/Studio.uplugin": JSON.stringify({ Modules: [{ Name: "Mixer" }, { Name: "PluginOnly" }] }),
+      "Plugins/Studio/Source/Tools/Mixer/Mixer.Build.cs": "class Mixer : ModuleRules {}",
+      "Plugins/Studio/Source/Tools/PluginOnly/PluginOnly.Build.cs": "class PluginOnly : ModuleRules {}",
+      "Source/Samples/Nested/Game.uproject": JSON.stringify({ Modules: [{ Name: "Mixer" }] }),
+      "Source/Samples/Nested/Source/Mixer/Mixer.Build.cs": "class Mixer : ModuleRules {}",
+    };
+    for (const [file, content] of Object.entries(files)) {
+      const target = path.join(tmpDir, file);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content);
+    }
+    const { nodes } = await buildCodeGraph(tmpDir);
+    const deps = (file: string) => nodes.find(n => n.relativePath === file)?.dependencies.sort();
+    expect(deps("Game.uproject")).toEqual(["Source/Media/Audio/Mixer/Mixer.Build.cs"]);
+    expect(deps("Plugins/Studio/Studio.uplugin")).toEqual([
+      "Plugins/Studio/Source/Tools/Mixer/Mixer.Build.cs", "Plugins/Studio/Source/Tools/PluginOnly/PluginOnly.Build.cs",
+    ]);
+    expect(deps("Source/Samples/Nested/Game.uproject")).toEqual(["Source/Samples/Nested/Source/Mixer/Mixer.Build.cs"]);
+  });
+
   it("traces an Unreal modular feature factory and its product through a task", async () => {
     fs.writeFileSync(path.join(tmpDir, "Audio.cpp"), [
       "class ISound { public: virtual void Play() = 0; };",
@@ -247,6 +273,18 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
       "UE::Tasks::Launch(TEXT(\"audio\"), [sound=MoveTemp(sound)]() { sound->Play(); });", "}",
       "void Rebound() { auto sound = IOutput::Select();",
       "UE::Tasks::Launch(TEXT(\"other\"), [sound=Different()]() { sound->Play(); });", "}",
+      "void Replace(IOutput* installed, IOutput* replacement) {",
+      "auto& registry = IModularFeatures::Get();",
+      "const auto key = IOutput::Key();",
+      "auto before = IOutput::Select();",
+      "registry.RegisterModularFeature(TEXT(\"Unrelated\"), replacement);",
+      "auto unrelated = IOutput::Select();",
+      "registry.UnregisterModularFeature(key, installed);",
+      "registry.RegisterModularFeature(key, replacement);",
+      "auto after = IOutput::Select();",
+      "before->Play();",
+      "unrelated->Play();",
+      "after->Play();", "}",
     ].join("\n"));
     const { cache } = await runPipeline();
     const contexts = await getSymbolContext(cache, "Open");
@@ -258,6 +296,47 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     expect(products.find(c => c.symbol.cppOwner === "Bell")?.callers.map(c => c.line)).toContain(18);
     expect(products.find(c => c.symbol.cppOwner === "Bell")?.callers.map(c => c.line)).not.toContain(21);
     expect(products.find(c => c.symbol.cppOwner === "Noise")?.callers.map(c => c.line)).not.toContain(18);
+    const bellCalls = products.find(c => c.symbol.cppOwner === "Bell")?.callers.map(c => c.line);
+    expect(bellCalls).toContain(32);
+    expect(bellCalls).toContain(33);
+    expect(bellCalls).not.toContain(34);
+  });
+
+  it("follows the current modular feature through local values and drops stale providers", async () => {
+    const lookup = (key: string) => `registry.GetModularFeatureImplementations<IOutput>(TEXT("${key}"))`;
+    const lines = [
+      "class IOutput : public IModularFeature { public: virtual int Play() = 0; };",
+      ...["One", "Two"].flatMap(name => [
+        `class ${name} : public IOutput { public:`,
+        `void Start() { IModularFeatures::Get().RegisterModularFeature(TEXT("${name}"),this); }`,
+        "int Play() override { return 1; }", "};",
+      ]),
+      "void Render(bool flag) {",
+      "auto& registry = IModularFeatures::Get();",
+      `auto outputs = ${lookup("One")};`,
+      "auto* selected = outputs[0];",
+      "selected->Play(); // before",
+      `outputs = ${lookup("Two")};`,
+      "outputs[0]->Play(); // after",
+      "selected->Play(); // snapshot",
+      `if (flag) outputs = ${lookup("One")};`,
+      "outputs[0]->Play(); // uncertain",
+      "outputs = Unknown();",
+      "outputs[0]->Play(); // unknown",
+      `outputs = ${lookup("One")};`,
+      "while (flag) {",
+      "outputs[0]->Play(); // loop-carried",
+      `outputs = ${lookup("Two")};`,
+      "outputs[0]->Play(); // assigned this iteration",
+      "}",
+      "}",
+    ];
+    fs.writeFileSync(path.join(tmpDir, "Radio.cpp"), lines.join("\n"));
+    const { cache } = await runPipeline();
+    const methods = await getSymbolContext(cache, "Play");
+    const linesFor = (owner: string) => methods.find(m => m.symbol.cppOwner === owner)?.callers.map(c => lines[c.line - 1]).sort();
+    expect(linesFor("One")).toEqual(["selected->Play(); // before", "selected->Play(); // snapshot"]);
+    expect(linesFor("Two")).toEqual(["outputs[0]->Play(); // after", "outputs[0]->Play(); // assigned this iteration"]);
   });
 
   it("follows typed C++ pointer calls into inline class methods", async () => {

@@ -85,6 +85,7 @@ export function linkUnrealModules(sources: Map<string, string>, nodes: Map<strin
       if (value && typeof value === "object") descriptors.set(file, value);
     } catch { /* Повреждённый дескриптор остаётся узлом без объявленных связей. */ }
   }
+  const descriptorRoots = new Map([...projects, ...plugins]);
   function domain(file: string) {
     const project = nearest(file, projects);
     const plugin = nearest(file, plugins);
@@ -126,8 +127,10 @@ export function linkUnrealModules(sources: Map<string, string>, nodes: Map<strin
   for (const [file, desc] of descriptors) {
     for (const m of Array.isArray(desc.Modules) ? desc.Modules : []) {
       if (typeof m?.Name !== "string") continue;
-      const target = path.join(path.dirname(file), "Source", m.Name, m.Name + ".Build.cs");
-      link(file, target, ["module", m.Type, m.LoadingPhase].filter(Boolean).join(" / "));
+      const candidates = byName.get(key(file, m.Name)) ?? [];
+      const local = candidates.filter(rule => nearest(rule, descriptorRoots) === file &&
+        path.relative(path.dirname(file), rule).startsWith("Source/"));
+      if (local.length === 1) link(file, local[0], ["module", m.Type, m.LoadingPhase].filter(Boolean).join(" / "));
     }
     if (!/\.uproject$/i.test(file)) continue;
     for (const plugin of plugins.values()) {

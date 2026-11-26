@@ -22,7 +22,7 @@ function declaration(node: SgNode) {
     ? initializer?.match(/(?:->|\.)GetSubsystem<([\w:]+)>\(\)$/)?.[1]
       ?? initializer?.match(/^(?:this->)?GetWorld\(\)->GetGameState<([\w:]+)>\(\)$/)?.[1]
     : type;
-  return { name: decl.text(), factory: value?.field("function")?.kind() === "qualified_identifier", type: inferred ? cppType(inferred) : undefined };
+  return { name: decl.text(), initializer: value, reference: node.field("declarator")?.field("declarator")?.kind() === "reference_declarator", type: inferred ? cppType(inferred) : undefined };
 }
 
 export function cppClassFields(cls: SgNode): Record<string, string> | undefined {
@@ -36,7 +36,7 @@ export function cppClassFields(cls: SgNode): Record<string, string> | undefined 
 }
 
 export function cppBindings(root: SgNode) {
-  const bindings = new Map<string, { type?: string; factory?: boolean; start: number; end: number }[]>();
+  const bindings = new Map<string, { type?: string; initializer?: SgNode | null; reference: boolean; start: number; end: number }[]>();
   for (const kind of ["parameter_declaration", "declaration", "for_range_loop"]) {
     for (const node of root.findAll({ rule: { kind } })) {
       const value = declaration(node);
@@ -46,7 +46,7 @@ export function cppBindings(root: SgNode) {
           ["compound_statement", "for_statement", "if_statement", "translation_unit"].includes(String(n.kind()))));
       if (!scope) continue;
       const list = bindings.get(value.name) ?? [];
-      list.push({ type: value.type, factory: value.factory, start: node.range().start.index, end: scope.range().end.index });
+      list.push({ type: value.type, initializer: value.initializer, reference: value.reference, start: node.range().start.index, end: scope.range().end.index });
       bindings.set(value.name, list);
     }
   }
