@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512">
+  <title>V — drapery aligned to the left stem</title>
+  <defs>
+    <clipPath id="left-diagonal" clipPathUnits="userSpaceOnUse"><path d="M54.2171581769437 0 H512 V460 H255.23592493297588 Z"/></clipPath>
+    <clipPath id="clearance" clipPathUnits="userSpaceOnUse">
+      <path clip-rule="evenodd" d="M0 0 H470 V460 H0 Z M419 48 C379 121 309 164 220 201 C181 216 146 231 153 259 C158 282 171 306 188 316 C177 300 190 289 214 282 C254 273 298 270 336 242 C382 207 406 122 419 48 Z"/>
+    </clipPath>
+  </defs>
+  <g transform="translate(11 27)">
+    <!-- The two uninterrupted diagonal edges are shared by all visible sections. -->
+    <path fill="#21211F" clip-path="url(#clearance)" d="M40 25 H184 V29 C160 31 150 43 158 64 L260 324 L343 64 C353 40 342 31 317 29 V25 H450 V29 C432 32 423 42 414 58 L247 432 Q245 435 243 432 L80 59 C71 40 58 33 40 29 Z"/>
+    <!-- Upper fold and lower fold, separated by a continuous transparent channel. -->
+    <path fill="#A99157" clip-path="url(#left-diagonal)" d="M414 56 C378 126 311 168 222 205 C185 220 151 232 157 258 C162 280 174 314 183 329 C174 305 181 289 205 271 C242 244 292 219 331 185 C371 150 399 99 414 56 Z"/>
+    <path fill="#A99157" d="M411 67 C392 134 360 177 319 211 C283 240 245 259 213 277 C252 268 296 265 333 238 C377 205 400 123 411 67 Z"/>
+  </g>
+</svg>

@@ -1,20 +1,12 @@
 {
-  "name": "socraticode-local",
+  "name": "socraticode-v-local",
+  "interface": { "displayName": "SocratiCode V" },
   "plugins": [
     {
-      "name": "socraticode",
-      "policy": {
-        "authentication": "ON_INSTALL",
-        "installation": "AVAILABLE"
-      },
-      "category": "Development",
-      "source": {
-        "path": "./plugins/socraticode",
-        "source": "local"
-      }
+      "name": "socraticode-v",
+      "source": { "path": "./plugins/socraticode-v", "source": "local" },
+      "policy": { "authentication": "ON_INSTALL", "installation": "AVAILABLE" },
+      "category": "Development"
     }
-  ],
-  "interface": {
-    "displayName": "SocratiCode V"
-  }
+  ]
 }

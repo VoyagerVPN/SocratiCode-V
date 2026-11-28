@@ -1,0 +1,4 @@
+#define IDI_SCV_COLOR_LIGHT 1
+#define IDI_SCV_COLOR_DARK 2
+#define IDI_SCV_MONO_LIGHT 3
+#define IDI_SCV_MONO_DARK 4

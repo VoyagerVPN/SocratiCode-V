@@ -1,29 +1,25 @@
 {
-  "name": "socraticode",
+  "name": "socraticode-v",
   "mcpName": "io.github.giancarloerra/socraticode",
-  "version": "1.16.1-local.9",
-  "description": "SocratiCode — MCP server for local codebase indexing, semantic search, and code dependency graphs. All private, all local via Docker.",
+  "version": "0.1.1",
+  "description": "SocratiCode V — local code search and dependency graphs for Windows.",
   "type": "module",
   "main": "dist/index.js",
-  "bin": {
-    "socraticode": "dist/launcher.js"
-  },
   "scripts": {
-    "build": "tsc && node scripts/copy-assets.mjs",
-    "check:release-versions": "node scripts/check-release-versions.mjs",
-    "start": "node dist/launcher.js",
-    "dev": "tsx src/index.ts",
+    "build": "node windows/build.mjs",
+    "start": "node windows/start.mjs",
+    "dev": "node windows/start.mjs",
     "lint": "biome check src/ tests/",
     "lint:fix": "biome check --write src/ tests/",
-    "release": "release-it",
-    "prepublishOnly": "tsc && node scripts/copy-assets.mjs",
-    "release:dry": "release-it --dry-run",
-    "test": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run",
+    "test": "node windows/test.mjs",
     "test:unit": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run tests/unit/",
     "test:integration": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run tests/integration/",
     "test:e2e": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run tests/e2e/",
     "test:watch": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs",
-    "test:coverage": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run --coverage"
+    "test:coverage": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run --coverage",
+    "build:engine": "tsc && node scripts/copy-assets.mjs",
+    "test:engine": "node --require ./scripts/windows-test-processes.cjs ./node_modules/vitest/vitest.mjs run",
+    "test:codex": "node windows/codex/smoke.mjs"
   },
   "keywords": [
     "mcp",
@@ -50,19 +46,6 @@
   },
   "homepage": "https://github.com/VoyagerVPN/SocratiCode-V",
   "license": "AGPL-3.0-only",
-  "files": [
-    "dist",
-    ".claude-plugin",
-    "skills",
-    "agents",
-    "hooks",
-    ".mcp.json",
-    "LICENSE",
-    "LICENSE-COMMERCIAL",
-    "README.md",
-    "THIRD-PARTY-LICENSES",
-    "socraticode_logo_thumbnail.png"
-  ],
   "dependencies": {
     "@ast-grep/lang-bash": "^0.0.7",
     "@ast-grep/lang-c": "^0.0.5",
@@ -117,7 +100,7 @@
     "vitest": "^4.1.11"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "overrides": {
     "vitest": {
@@ -127,5 +110,6 @@
     "release-it": {
       "undici": "7.29.1"
     }
-  }
+  },
+  "private": true
 }

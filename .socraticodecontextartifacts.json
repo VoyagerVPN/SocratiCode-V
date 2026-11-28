@@ -2,13 +2,8 @@
   "artifacts": [
     {
       "name": "local-installation",
-      "path": "plugins/socraticode/README-SETUP.md",
-      "description": "Установка переносимого плагина, расположение зависимостей и запуск общего MCP из Codex."
-    },
-    {
-      "name": "idle-lifecycle",
-      "path": "IDLE_LIFECYCLE.md",
-      "description": "Правила остановки Qdrant и Ollama, защита активных операций и проверка готовности после простоя."
+      "path": "README.md",
+      "description": "Сборка Windows, плагин Codex и запуск общего MCP."
     }
   ]
 }

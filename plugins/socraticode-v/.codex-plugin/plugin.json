@@ -1,0 +1,20 @@
+{
+  "name": "socraticode-v",
+  "version": "0.1.0",
+  "description": "Поиск по коду и граф зависимостей через нативный SocratiCode V для Windows.",
+  "author": { "name": "VoyagerVPN" },
+  "repository": "https://github.com/VoyagerVPN/SocratiCode-V",
+  "skills": "./skills/",
+  "mcpServers": "./mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "SocratiCode V",
+    "shortDescription": "Поиск и граф кода",
+    "longDescription": "Ищет по смыслу и точному фрагменту, показывает связи в коде и обновляет подготовленный индекс при сохранении файлов. Подключается к локальному SocratiCode V для Windows.",
+    "developerName": "VoyagerVPN",
+    "category": "Development",
+    "capabilities": ["Read"],
+    "logo": "./assets/scv.png",
+    "composerIcon": "./assets/scv.png"
+  }
+}

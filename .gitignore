@@ -4,6 +4,9 @@ dist/
 .cache/
 .temp/
 .lab/
+/runtime/
+/plugins/socraticode-v/mcp.json
+/plugins/socraticode-v/hooks/hooks.json
 .research/
 %SystemDrive%/
 .tgrep/
